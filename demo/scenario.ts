@@ -67,7 +67,8 @@ export async function buildMockScenario(
   const ada = world.createAccount("human", { dob: "1995-04-12" });
   // Agent IDP flow: Ada reveals only her date of birth to the agent's identity.
   const kitAccount = world.createAccount("agent", { dob: "1995-04-12" });
-  const kitBadge = world.registerAgent(kitAccount.address, { agentWallet: kitAccount.address });
+  // Ada owns Kit's badge (only she can change its signet.mandate); Kit's account is the badge's agentWallet and pays.
+  const kitBadge = world.registerAgent(ada.address, { agentWallet: kitAccount.address });
   world.mint(kitAccount.address, "USDR", USDR(150));
 
   const shop = world.createAccount("business");
@@ -135,7 +136,7 @@ export async function buildMockScenario(
   // Ada signs Kit's mandate with her own account and publishes its hash on Kit's badge.
   const mandate = adaMandate(kitBadge, ada.address);
   const signedMandate = await signMandate(mandate, world.prover(ada.address));
-  world.publishMandate(kitBadge, mandateHash(mandate));
+  world.publishMandate(kitBadge, mandateHash(mandate), ada.address);
   const kit = new SignetBuyer({
     badge: kitBadge,
     mandate: signedMandate,
@@ -153,7 +154,7 @@ export async function buildMockScenario(
   kitLedger.append({ type: "mandate_published", actor: kitBadge, data: { mandate: kit.mandateHash, owner: ada.address, asset: mandate.asset, perPaymentLimit: mandate.perPaymentLimit, dailyLimit: mandate.dailyLimit } });
 
   const teenMandate = adaMandate(teenBadge, teen.address);
-  world.publishMandate(teenBadge, mandateHash(teenMandate));
+  world.publishMandate(teenBadge, mandateHash(teenMandate), teen.address);
   const teenAgent = new SignetBuyer({
     badge: teenBadge,
     mandate: await signMandate(teenMandate, world.prover(teen.address)),

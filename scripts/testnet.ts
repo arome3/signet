@@ -6,15 +6,23 @@
  *   npm run testnet -- check                       preflight: keys, accounts, balances, IdPs, badges, mandate, DNS, directory
  *   npm run testnet -- card agent <public-url>     build the agent's Agent Card -> out/testnet/agent-card.json (host it at <public-url>)
  *   npm run testnet -- card merchant <public-url>  same for the merchant
- *   npm run testnet -- register agent|merchant     verify the hosted card's hash, then mint the CIS-8004 badge (signed with that role's key)
+ *   npm run testnet -- register agent|merchant     verify the hosted card's hash, then mint the CIS-8004 badge
+ *   npm run testnet -- wallet agent                set the agent's account as the badge's agentWallet (agent signs, owner sends)
  *   npm run testnet -- card agent                  after registering: rebuild the card with its tokenAddress (host it at the same URL)
  *   npm run testnet -- pin agent|merchant          verify the re-hosted card, then pin its hash on-chain with setAgentURI
  *   npm run testnet -- publish-mandate             set the agent badge's `signet.mandate` metadata to the signed mandate's hash
+ *
+ * Who controls each badge: the OWNER registers the agent's badge and is its CIS-2 owner, so only the owner
+ * can change `signet.mandate` (merchants require the mandate's owner to be the badge owner); the agent's
+ * account is only the badge's agentWallet and pays. The merchant registers and owns its own badge.
+ * Every transaction is dry-run with invokeInstance first and is not sent if the contract would reject it.
  */
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { AccountAddress, CcdAmount, ContractAddress, Energy, Parameter, ReceiveName, TransactionExpiry, TransactionHash } from "@concordium/web-sdk";
+import { AccountAddress, BlockHash, CcdAmount, ContractAddress, Energy, Parameter, ReceiveName, ReturnValue, TransactionExpiry, TransactionHash } from "@concordium/web-sdk";
 import { Transaction } from "@concordium/web-sdk/transactions";
+import { serializeAccountSignature } from "../src/concordium/account.js";
+import { agentTokenIdParam, parseWalletNonce, setAgentWalletMessage } from "../src/concordium/agent-wallet.js";
 import { explorerTx, grpcClient, loadConfig, loadWalletExport, type LoadedAccount } from "../src/concordium/config.js";
 import { DnsDomainVerifier } from "../src/concordium/domain.js";
 import { ConcordiumRegistry, registryTool } from "../src/concordium/registry.js";
@@ -33,6 +41,9 @@ const KEYS: Record<Role | "owner", string> = {
   agent: process.env.AGENT_WALLET_FILE ?? "keys/agent.export",
   merchant: process.env.MERCHANT_WALLET_FILE ?? "keys/merchant.export",
 };
+/** The account that registers and owns each badge (see the header). */
+const CONTROLLER: Record<Role, "owner" | "merchant"> = { agent: "owner", merchant: "merchant" };
+const controller = (r: Role) => loadWalletExport(KEYS[CONTROLLER[r]]);
 const accountLink = (a: string) => `https://ccdexplorer.io/${cfg.network}/account/${a}`;
 const state = (r: Role): Record<string, any> => (existsSync(`${OUT}/${r}.json`) ? JSON.parse(readFileSync(`${OUT}/${r}.json`, "utf8")) : {});
 const save = (r: Role, s: Record<string, unknown>) => writeFileSync(`${OUT}/${r}.json`, JSON.stringify(s, null, 2) + "\n");
@@ -43,8 +54,24 @@ const mcp = async (name: string, args: Record<string, unknown>) => {
 };
 const role = (x?: string): Role => (x === "agent" || x === "merchant" ? x : (console.error("role must be agent or merchant"), process.exit(2)));
 
-/** Signs and submits a contract update built by the registry MCP server; waits for finalization. */
+const json = (x: unknown) => JSON.stringify(x, (_, v) => (typeof v === "bigint" ? v.toString() : v));
+
+/** Runs a contract update built by the registry MCP server as `sender` without sending it (free). */
+async function dryRun(sender: string, built: any): Promise<{ ok: boolean; reason?: string }> {
+  const r = await grpc.invokeContract({
+    invoker: AccountAddress.fromBase58(sender),
+    contract: ContractAddress.create(built.contract_address.index, built.contract_address.subindex),
+    method: ReceiveName.fromString(built.receive_name),
+    parameter: Parameter.fromHexString(built.parameter_hex),
+    energy: Energy.create(BigInt(built.suggested_energy ?? 30000) * 2n),
+  });
+  return r.tag === "success" ? { ok: true } : { ok: false, reason: json(r.reason).slice(0, 200) };
+}
+
+/** Dry-runs, then signs and submits a contract update built by the registry MCP server; waits for finalization. */
 async function sendUpdate(acc: LoadedAccount, built: any): Promise<string> {
+  const d = await dryRun(acc.address, built);
+  if (!d.ok) throw new Error(`dry run of ${built.receive_name} as ${acc.address} was rejected, nothing sent: ${d.reason}`);
   const payload = {
     amount: CcdAmount.zero(),
     address: ContractAddress.create(built.contract_address.index, built.contract_address.subindex),
@@ -70,7 +97,7 @@ async function card(r: Role, uriArg?: string) {
   // Concordium extension block is complete, and pin the new hash with `pin`.
   const uri = uriArg ?? prev.agentUri;
   if (!uri || !/^https:\/\//.test(uri)) throw new Error("give the public https URL where you will host the card");
-  const acc = loadWalletExport(KEYS[r]);
+  const acc = controller(r);
   const isAgent = r === "agent";
   const built = await mcp("build_agent_card", {
     name: isAgent ? "Kit (Signet shopping agent)" : (process.env.MERCHANT_NAME ?? "FreshMart"),
@@ -79,6 +106,8 @@ async function card(r: Role, uriArg?: string) {
       : "Grocery merchant agent: quotes over x402, checks buyer badges, mandates and age, settles on Concordium.",
     agent_uri: uri,
     owner_account: acc.address,
+    // The agent pays from its own account, set on-chain by `wallet agent`; the card must say the same.
+    ...(isAgent ? { agent_wallet: loadWalletExport(KEYS.agent).address } : {}),
     ...(prev.tokenId !== undefined ? { token_id: String(prev.tokenId) } : {}),
     skills: isAgent
       ? [{ id: "shop", name: "Shop within a mandate", description: "Buys from verified merchants within its owner's limits", tags: ["signet", "x402"] }]
@@ -105,7 +134,7 @@ async function pin(r: Role) {
   if (s.tokenId === undefined) throw new Error(`register ${r} first`);
   if (s.pinned !== false) throw new Error(`nothing new to pin; run: npm run testnet -- card ${r}`);
   await hostedCardMatches(s.agentUri, s.metadataHash, s.cardFile);
-  const acc = loadWalletExport(KEYS[r]);
+  const acc = controller(r);
   const built = await mcp("build_set_agent_uri", { token_id: String(s.tokenId), agent_uri: s.agentUri, metadata_hash_hex: s.metadataHash, sender: acc.address });
   const tx = await sendUpdate(acc, built);
   const v = await mcp("verify_agent_card", { token_id: String(s.tokenId) });
@@ -118,9 +147,9 @@ async function register(r: Role) {
   const s = state(r);
   if (!s.agentUri) throw new Error(`run: npm run testnet -- card ${r} <url> first`);
   if (s.badge) return console.log(`${r} already registered: badge ${s.badge} (${s.registerTx})`);
-  const acc = loadWalletExport(KEYS[r]);
+  const acc = controller(r);
   await hostedCardMatches(s.agentUri, s.metadataHash, s.cardFile);
-  console.log(`Card at ${s.agentUri} matches. Registering ${r} from ${acc.address} ...`);
+  console.log(`Card at ${s.agentUri} matches. Registering the ${r} badge from the ${CONTROLLER[r]} account ${acc.address} ...`);
   const built = await mcp("build_register", { agent_uri: s.agentUri, metadata_hash_hex: s.metadataHash, sender: acc.address });
   const tx = await sendUpdate(acc, built);
   let agent: any;
@@ -132,7 +161,56 @@ async function register(r: Role) {
   if (!agent) throw new Error(`registered (tx ${tx}) but the indexer has not listed it yet; rerun 'check' in a minute`);
   const ta = await mcp("token_address", { contract_index: built.contract_address.index, contract_subindex: built.contract_address.subindex, token_id: String(agent.token_id) });
   save(r, { ...s, tokenId: String(agent.token_id), badge: ta.token_address, registerTx: tx });
-  console.log(`${r} badge: ${ta.token_address} (token ${agent.token_id})\nSet ${r === "agent" ? "AGENT_BADGE" : "MERCHANT_BADGE"}=${ta.token_address} in .env`);
+  console.log(`${r} badge: ${ta.token_address} (token ${agent.token_id}), owned by ${acc.address}\nSet ${r === "agent" ? "AGENT_BADGE" : "MERCHANT_BADGE"}=${ta.token_address} in .env`);
+  if (r === "agent") console.log("Next: npm run testnet -- wallet agent");
+}
+
+const walletOf = (d: any): string | undefined => (typeof d === "string" ? d : (d?.agent_wallet ?? d?.wallet ?? d?.address ?? undefined)) || undefined;
+
+/**
+ * Sets the agent's account as the badge's agentWallet. CIS-8004 needs two authorisations: the agent's account
+ * signs the 162-byte setAgentWallet message (proving it agrees to be the wallet) and the owner sends the
+ * transaction. See src/concordium/agent-wallet.ts for the layout the deployed contract checks. Dry-run first;
+ * nothing is sent unless the contract would accept it.
+ */
+async function setWallet() {
+  const s = state("agent");
+  if (s.tokenId === undefined) throw new Error("register agent first");
+  const owner = controller("agent");
+  const agent = loadWalletExport(KEYS.agent);
+  const token_id = String(s.tokenId);
+  if (walletOf(await mcp("get_agent_wallet", { token_id })) === agent.address) {
+    save("agent", { ...s, agentWallet: agent.address });
+    return console.log(`agentWallet is already ${agent.address}`);
+  }
+  const contract = cfg.registryContract;
+  const nr = await grpc.invokeContract({
+    contract: ContractAddress.create(contract.index, contract.subindex),
+    method: ReceiveName.fromString("CIS-8004.getAgentWalletNonce"),
+    parameter: Parameter.fromHexString(agentTokenIdParam(BigInt(token_id)).toString("hex")),
+    energy: Energy.create(50_000n),
+  });
+  if (nr.tag !== "success" || !nr.returnValue) throw new Error(`getAgentWalletNonce failed: ${json(nr.tag === "failure" ? nr.reason : "no value").slice(0, 200)}`);
+  const nonce = parseWalletNonce(ReturnValue.toBuffer(nr.returnValue));
+  const genesisHash = BlockHash.toBuffer((await grpc.getConsensusStatus()).genesisBlock);
+  const deadlineMs = BigInt(Date.now() + 5 * 60_000);
+  const message = setAgentWalletMessage({
+    tokenId: BigInt(token_id),
+    owner: AccountAddress.toBuffer(owner.accountAddress),
+    newWallet: AccountAddress.toBuffer(agent.accountAddress),
+    nonce,
+    deadlineMs,
+    contract,
+    genesisHash,
+  });
+  // Plain Ed25519 over the message (the contract's check_account_signature), as serialized AccountSignatures.
+  const signature_hex = serializeAccountSignature(await agent.signer.sign(new Uint8Array(message).buffer));
+  const built = await mcp("build_set_agent_wallet", { token_id, new_wallet: agent.address, deadline_unix_ms: Number(deadlineMs), signature_hex, sender: owner.address });
+  const tx = await sendUpdate(owner, built);
+  const now = walletOf(await mcp("get_agent_wallet", { token_id }));
+  save("agent", { ...s, agentWallet: agent.address, walletTx: tx });
+  if (now !== agent.address) throw new Error(`setAgentWallet sent (tx ${tx}) but the registry reads back ${now ?? "nothing"}`);
+  console.log(`agentWallet = ${agent.address} on ${s.badge}, read back OK.`);
 }
 
 async function publishMandate() {
@@ -140,7 +218,8 @@ async function publishMandate() {
   if (!s.badge) throw new Error("register the agent first");
   const signed = loadSignedMandate(process.env.SIGNED_MANDATE_FILE ?? "out/mandate.signed.json", s.badge);
   const hash = mandateHash(signed.mandate);
-  const acc = loadWalletExport(KEYS.agent);
+  const acc = controller("agent");
+  if (signed.mandate.owner !== acc.address) throw new Error(`the mandate names owner ${signed.mandate.owner}, but the badge owner key is ${acc.address}; merchants would refuse it`);
   const built = await mcp("build_set_metadata", { token_id: s.tokenId, key: "signet.mandate", value_hex: Buffer.from(hash, "utf8").toString("hex"), sender: acc.address });
   const tx = await sendUpdate(acc, built);
   const v = await new ConcordiumRegistry(cfg, grpc, 0).check(s.badge);
@@ -173,7 +252,8 @@ async function check() {
       const ccd = Number((info as any).accountAmount?.microCcdAmount ?? 0n) / 1e6;
       const ip = await registry.identityProviderOf(acc.address);
       const tokens = ((info as any).accountTokens ?? []).map((t: any) => `${t.id?.value ?? t.id} ${t.state?.balance?.value ?? t.state?.balance ?? "?"}`).join(", ");
-      console.log(`ok   ${r}: ${acc.address}  ${ccd} CCD${tokens ? `, tokens: ${tokens}` : ""}  IdP ${ip}  ${accountLink(acc.address)}`);
+      // Every role sends transactions (owner: register/wallet/mandate; agent: payments, anchors; merchant: register, anchors).
+      console.log(`${ok(ccd > 0)} ${r}: ${acc.address}  ${ccd} CCD${ccd > 0 ? "" : " (needs CCD for fees: wallet testnet faucet)"}${tokens ? `, tokens: ${tokens}` : ""}  IdP ${ip}  ${accountLink(acc.address)}`);
     } catch (e) {
       console.log(`FAIL ${r}: cannot read ${KEYS[r]} (${(e as Error).message.slice(0, 80)})`);
     }
@@ -185,8 +265,23 @@ async function check() {
       continue;
     }
     const v = await registry.check(badge);
-    const owns = accounts[r] && [v.owner, v.agentWallet].includes(accounts[r]!.address);
-    console.log(`${ok(v.verified && !!owns)} ${r} badge ${badge}: verified=${v.verified} ownerKind=${v.ownerKind} key-account-bound=${!!owns}${v.issues.length ? ` issues=${v.issues.join(",")}` : ""}`);
+    const ctrl = accounts[CONTROLLER[r]];
+    console.log(`${ok(v.verified)} ${r} badge ${badge}: verified=${v.verified} ownerKind=${v.ownerKind}${v.issues.length ? ` issues=${v.issues.join(",")}` : ""}`);
+    console.log(`${ok(!!ctrl && v.owner === ctrl.address)} ${r} badge owner is the ${CONTROLLER[r]} account (${v.owner ?? "none"})`);
+    if (r === "agent") {
+      console.log(`${ok(!!accounts.agent && v.agentWallet === accounts.agent.address)} agentWallet is the agent account (${v.agentWallet ?? "not set: npm run testnet -- wallet agent"})`);
+      const tokenId = state("agent").tokenId;
+      if (tokenId !== undefined && accounts.agent && ctrl) {
+        // Free dry run of the attack this design prevents: the agent rewriting its own mandate. Uses a valid
+        // value (a 64-hex hash, as published) so the only difference between the two runs is the sender, and
+        // requires the agent's rejection to be CIS-8004 Unauthorized (-7201), not some other error.
+        const value_hex = Buffer.from(v.mandateHash ?? "0".repeat(64), "utf8").toString("hex");
+        const probe = await mcp("build_set_metadata", { token_id: String(tokenId), key: "signet.mandate", value_hex, sender: accounts.agent.address });
+        const [asAgent, asOwner] = [await dryRun(accounts.agent.address, probe), await dryRun(ctrl.address, probe)];
+        const unauthorized = !asAgent.ok && /"rejectReason":-7201\b/.test(asAgent.reason ?? "");
+        console.log(`${ok(unauthorized && asOwner.ok)} only the owner can change signet.mandate (dry run: agent ${asAgent.ok ? "ACCEPTED" : unauthorized ? "rejected as Unauthorized" : `rejected for another reason: ${asAgent.reason}`}, owner ${asOwner.ok ? "accepted" : `rejected: ${asOwner.reason}`})`);
+      }
+    }
     // Concordium's own badge verdict: top-level badge_valid, a checks map and an issues list.
     const cb = await registryTool(cfg.registryMcpUrl, "check_badge", { id: badge, network: cfg.network });
     const d = (cb.data ?? {}) as Record<string, any>;
@@ -217,8 +312,9 @@ try {
   else if (cmd === "card") await card(role(a), b);
   else if (cmd === "register") await register(role(a));
   else if (cmd === "pin") await pin(role(a));
+  else if (cmd === "wallet") await (role(a) === "agent" ? setWallet() : Promise.reject(new Error("only the agent's badge needs an agentWallet")));
   else if (cmd === "publish-mandate") await publishMandate();
-  else console.log("usage: npm run testnet -- check | card <agent|merchant> [url] | register <agent|merchant> | pin <agent|merchant> | publish-mandate");
+  else console.log("usage: npm run testnet -- check | card <agent|merchant> [url] | register <agent|merchant> | wallet agent | pin <agent|merchant> | publish-mandate");
 } catch (e) {
   console.error(`error: ${(e as Error).message}`);
   process.exit(1);

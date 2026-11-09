@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { AutoConsent } from "../src/core/consent.js";
-import { evaluateMandate, mandateHash, signMandate, signSpend, utcDay } from "../src/core/mandate.js";
+import { checkSignedMandate, evaluateMandate, mandateHash, signMandate, signSpend, utcDay } from "../src/core/mandate.js";
 import { signAs } from "../src/core/signing.js";
 import { adaMandate, buildMockScenario, USDR, type Scenario } from "../demo/scenario.js";
 import { craftPay, post, quote } from "./helpers.js";
@@ -14,6 +14,29 @@ describe("owner-signed mandate (unit)", () => {
     try {
       const m = adaMandate(s.kitBadge, s.ada.address);
       await expect(signMandate(m, s.world.prover(s.kitAccount.address))).rejects.toThrow(/owner/);
+    } finally {
+      s.close();
+    }
+  });
+
+  it("only the badge owner can publish signet.mandate; the agent's own account cannot", async () => {
+    const s = await buildMockScenario();
+    try {
+      const hash = mandateHash(adaMandate(s.kitBadge, s.ada.address));
+      expect(s.world.agents.get(s.kitBadge)).toMatchObject({ owner: s.ada.address, agentWallet: s.kitAccount.address });
+      expect(() => s.world.publishMandate(s.kitBadge, hash, s.kitAccount.address)).toThrow(/Unauthorized/);
+      expect(() => s.world.publishMandate(s.kitBadge, hash, s.ada.address)).not.toThrow();
+    } finally {
+      s.close();
+    }
+  });
+
+  it("checkSignedMandate fails closed when the registry names no owner", async () => {
+    const s = await buildMockScenario();
+    try {
+      const own = { agent: s.kitBadge, publishedHash: mandateHash(s.signedMandate.mandate) };
+      expect((await checkSignedMandate(s.signedMandate, { ...own, owner: s.ada.address }, s.world.verifier())).issues).toEqual([]);
+      expect((await checkSignedMandate(s.signedMandate, { ...own, owner: undefined }, s.world.verifier())).issues).toEqual(["mandate_owner_not_badge_owner"]);
     } finally {
       s.close();
     }
@@ -92,7 +115,7 @@ describe("merchant-side mandate check (compromised buyer runtime)", () => {
   it("refuses an expired owner-signed mandate", async () => {
     s = await buildMockScenario();
     const old = { ...adaMandate(s.kitBadge, s.ada.address), validUntil: new Date(Date.now() - 1000).toISOString() };
-    s.world.publishMandate(s.kitBadge, mandateHash(old));
+    s.world.publishMandate(s.kitBadge, mandateHash(old), s.ada.address);
     const q = await quote(s);
     const r = await post(s, q.offer.order.id, (await craftPay(s, q, { mandate: await signMandate(old, s.world.prover(s.ada.address)) })).headers);
     expect(r.status).toBe(403);
@@ -174,6 +197,22 @@ describe("merchant-side mandate check (compromised buyer runtime)", () => {
     expect(refused.status === "denied" && refused.stage).toBe("consent");
     expect(refused.status === "denied" && refused.reasons).toContain("daily_limit_exceeded");
     expect(s.world.balance(s.kitAccount.address, "USDR")).toBe(USDR(150) - 2n * USDR(19.2));
+  });
+
+  it("refuses a mandate whose owner is not the badge's registry owner (an agent vouching for itself)", async () => {
+    s = await buildMockScenario();
+    // Old setup: the agent's account owns its own badge, so it may write signet.mandate. It invents an
+    // "owner", has that throwaway key sign unlimited limits, and publishes the hash itself.
+    const selfOwned = s.world.registerAgent(s.kitAccount.address, { agentWallet: s.kitAccount.address });
+    const stooge = s.world.createAccount("human");
+    const unlimited = { ...adaMandate(selfOwned, stooge.address), perPaymentLimit: USDR(10_000).toString(), dailyLimit: USDR(10_000).toString(), hardLimit: USDR(10_000).toString() };
+    const forged = await signMandate(unlimited, s.world.prover(stooge.address));
+    s.world.publishMandate(selfOwned, mandateHash(unlimited), s.kitAccount.address);
+    const q = await quote(s, OVER_LIMIT, { badge: selfOwned });
+    const r = await post(s, q.offer.order.id, (await craftPay(s, q, { badge: selfOwned, mandate: forged })).headers);
+    expect(r.status).toBe(403);
+    expect(r.body.reasons).toEqual(["mandate_owner_not_badge_owner"]);
+    expect(s.world.balance(s.kitAccount.address, "USDR")).toBe(USDR(150));
   });
 
   it("accepts a correctly built payment (control case)", async () => {

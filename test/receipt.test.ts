@@ -121,7 +121,8 @@ describe("receipts with inclusion proofs", () => {
 
   it("rejects a receipt naming a payer that is not the buyer badge's account", async () => {
     const { proof } = await paidAndAnchored();
-    const forged = await resign(proof.receipt, { payer: s.ada.address });
+    // Ada owns Kit's badge, so she is a bound account; use one with no tie to the badge.
+    const forged = await resign(proof.receipt, { payer: s.world.createAccount("human").address });
     expect((await verifyReceipt({ ...proof, receipt: forged }, deps(s))).checks.payer_bound_to_buyer.ok).toBe(false);
   });
 
