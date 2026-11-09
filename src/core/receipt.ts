@@ -1,5 +1,6 @@
 import { decodeAnchor } from "./anchor.js";
 import { hashOf, verifyMerkleProof } from "./canonical.js";
+import { orderMemo } from "./memo.js";
 import { type AuditLedger, entryHashValid } from "./ledger.js";
 import type { Receipt, ReceiptBody, ReceiptProof } from "./protocol.js";
 import { signAs, verifySigned } from "./signing.js";
@@ -114,8 +115,10 @@ export async function verifyReceipt(
     if (!merchantAccounts.includes(r.payTo)) return "payto_not_merchant_account";
     const transfers = await deps.chain.transfers(r.txHash);
     if (!transfers) return "payment_tx_not_found";
-    const hit = transfers.some((t) => t.from === r.payer && t.to === r.payTo && t.asset === r.asset && t.amount === r.paid);
-    return hit ? undefined : "payment_does_not_match_receipt";
+    const hits = transfers.filter((t) => t.from === r.payer && t.to === r.payTo && t.asset === r.asset && t.amount === r.paid);
+    if (!hits.length) return "payment_does_not_match_receipt";
+    // The transfer itself names the order it pays for, so one payment cannot back two receipts.
+    return hits.some((t) => t.memo === orderMemo(r.orderHash)) ? undefined : "payment_memo_not_order";
   });
 
   await run("payer_bound_to_buyer", async () => {

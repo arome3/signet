@@ -14,6 +14,7 @@ import type { AttributeProof, ConsentResult } from "./types.js";
  *                `extensions.signet` carries a SignetOffer: the order, the merchant's badge,
  *                the merchant's proof of controlling that badge (signed over the buyer nonce),
  *                a challenge for the buyer, and any attribute requirements (e.g. age_over 18).
+ *                `accepts[0].extra.memo` is "signet:<orderHash>": the transfer must carry it on chain.
  *   3. Buyer verifies the merchant, checks its mandate, asks the owner if needed, then
  *      -> POST /orders/:id/pay with
  *         PAYMENT-SIGNATURE (x402 payload, sponsored Concordium transfer, sender-signed)

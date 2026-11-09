@@ -49,7 +49,7 @@ export class MockWorld {
   agents = new Map<string, AgentRecord>();
   dataRegistrations: { txHash: string; sender: string; data: string; ts: string }[] = [];
   /** Settled transfers by tx hash (stands in for the chain; a tx can only be included once). */
-  transfers = new Map<string, { from: string; to: string; asset: string; amount: string; sponsor: string }>();
+  transfers = new Map<string, { from: string; to: string; asset: string; amount: string; sponsor: string; memo?: string }>();
   facilitator: string;
   /** Mock DNS: TXT records at _signet.<domain>. */
   dnsTxt = new Map<string, string[]>();
@@ -216,7 +216,7 @@ export class MockWorld {
       },
       transfers: async (txHash) => {
         const t = this.transfers.get(txHash);
-        return t ? [{ from: t.from, to: t.to, asset: t.asset, amount: t.amount }] : undefined;
+        return t ? [{ from: t.from, to: t.to, asset: t.asset, amount: t.amount, memo: t.memo }] : undefined;
       },
     };
   }
@@ -226,12 +226,14 @@ export class MockWorld {
     const world = this;
     return {
       network: MOCK_NETWORK,
-      async requirements({ payTo, asset, amount, maxTimeoutSeconds = 120 }) {
-        return { scheme: "exact", network: MOCK_NETWORK, asset, amount: amount.toString(), payTo, maxTimeoutSeconds, extra: { feePayer: world.facilitator } } as PaymentRequirements;
+      async requirements({ payTo, asset, amount, memo, maxTimeoutSeconds = 120 }) {
+        const extra = memo === undefined ? { feePayer: world.facilitator } : { feePayer: world.facilitator, memo };
+        return { scheme: "exact", network: MOCK_NETWORK, asset, amount: amount.toString(), payTo, maxTimeoutSeconds, extra } as PaymentRequirements;
       },
       async createPayment(req) {
         if (!sender) throw new Error("rail has no sender");
-        const tx = { version: 1, sender, sponsor: String(req.extra.feePayer), to: req.payTo, asset: req.asset, amount: req.amount, nonce: randomHex(8), expiry: Math.floor(Date.now() / 1000) + 300 };
+        const memo = req.extra?.memo === undefined ? {} : { memo: String(req.extra.memo) };
+        const tx = { version: 1, sender, sponsor: String(req.extra.feePayer), to: req.payTo, asset: req.asset, amount: req.amount, ...memo, nonce: randomHex(8), expiry: Math.floor(Date.now() / 1000) + 300 };
         const sig = edSign(null, Buffer.from(canonicalJson(tx)), world.mustAccount(sender).priv).toString("hex");
         return { x402Version: 2, accepted: req, payload: { signedTransaction: tx, signature: sig } } as PaymentPayload;
       },
@@ -245,6 +247,7 @@ export class MockWorld {
         if (tx.amount !== req.amount) return { isValid: false, invalidReason: "wrong_amount", payer: tx.sender };
         if (tx.asset !== req.asset) return { isValid: false, invalidReason: "wrong_asset", payer: tx.sender };
         if (tx.sponsor !== world.facilitator) return { isValid: false, invalidReason: "wrong_sponsor", payer: tx.sender };
+        if (req.extra?.memo !== undefined && tx.memo !== req.extra.memo) return { isValid: false, invalidReason: "memo_mismatch", payer: tx.sender };
         if (tx.expiry < Date.now() / 1000) return { isValid: false, invalidReason: "expired", payer: tx.sender };
         if (world.balance(tx.sender, tx.asset) < BigInt(tx.amount)) return { isValid: false, invalidReason: "insufficient_funds", payer: tx.sender };
         return { isValid: true, payer: tx.sender };
@@ -256,7 +259,7 @@ export class MockWorld {
         if (!v.isValid) return { success: false, errorReason: v.invalidReason, transaction: "", network: MOCK_NETWORK, payer: v.payer };
         const txHash = hashOf({ tx, sig: p.payload.signature });
         if (world.transfers.has(txHash)) return { success: false, errorReason: "duplicate_transaction", transaction: "", network: MOCK_NETWORK, payer: v.payer };
-        world.transfers.set(txHash, { from: tx.sender, to: tx.to, asset: tx.asset, amount: tx.amount, sponsor: tx.sponsor });
+        world.transfers.set(txHash, { from: tx.sender, to: tx.to, asset: tx.asset, amount: tx.amount, sponsor: tx.sponsor, memo: tx.memo });
         world.mustAccount(tx.sender).balances.set(tx.asset, world.balance(tx.sender, tx.asset) - BigInt(tx.amount));
         world.mint(tx.to, tx.asset, BigInt(tx.amount));
         return { success: true, transaction: txHash, network: MOCK_NETWORK, payer: tx.sender, amount: tx.amount };

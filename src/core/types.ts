@@ -97,9 +97,12 @@ export interface AttributeVerifier {
 /** The money rail. Live = x402 exact scheme on Concordium (PLT + sponsored tx). */
 export interface PaymentRail {
   readonly network: string;
-  /** Seller side: requirements for a price, with the facilitator as fee payer. */
-  requirements(input: { payTo: string; asset: string; amount: bigint; maxTimeoutSeconds?: number }): Promise<PaymentRequirements>;
-  /** Buyer side: build and sender-sign the payment. */
+  /**
+   * Seller side: requirements for a price, with the facilitator as fee payer. `memo` (see core/memo.ts)
+   * goes in `extra.memo`; the payment must then carry exactly that memo or `verify` refuses it.
+   */
+  requirements(input: { payTo: string; asset: string; amount: bigint; memo?: string; maxTimeoutSeconds?: number }): Promise<PaymentRequirements>;
+  /** Buyer side: build and sender-sign the payment, with `extra.memo` on the transfer when present. */
   createPayment(req: PaymentRequirements): Promise<PaymentPayload>;
   /** Seller/facilitator side. */
   verify(p: PaymentPayload, req: PaymentRequirements): Promise<VerifyResponse>;
@@ -114,8 +117,8 @@ export interface PaymentRail {
 export interface ChainReader {
   readonly network: string;
   registeredData(txHash: string): Promise<{ sender: string; data: Uint8Array } | undefined>;
-  /** Token transfers in a transaction; amounts in atomic units. */
-  transfers(txHash: string): Promise<{ from: string; to: string; asset: string; amount: string }[] | undefined>;
+  /** Token transfers in a transaction; amounts in atomic units; `memo` is the decoded memo text, if any. */
+  transfers(txHash: string): Promise<{ from: string; to: string; asset: string; amount: string; memo?: string }[] | undefined>;
 }
 
 /**

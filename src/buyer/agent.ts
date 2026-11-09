@@ -1,6 +1,7 @@
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from "@x402/core/http";
 import type { PaymentRequired } from "@x402/core/types";
 import { hashOf, randomHex } from "../core/canonical.js";
+import { orderMemo } from "../core/memo.js";
 import { Mutex, withTimeout } from "../core/lock.js";
 import { checkBadgeProof, encodeHeader, proveBadge } from "../core/challenge.js";
 import { checkMerchantListing, checkPrices, type SignedDirectory } from "../core/directory.js";
@@ -140,6 +141,8 @@ export class SignetBuyer {
     const merchantIssues = [...merchant.issues];
     if (hashOf(offer.order) !== offer.orderHash) merchantIssues.push("order_hash_mismatch");
     if (req.amount !== offer.order.total || req.asset !== offer.order.asset) merchantIssues.push("payment_terms_mismatch");
+    // The transfer will carry this memo on chain; it must name this order and nothing else.
+    if (req.extra?.memo !== orderMemo(offer.orderHash)) merchantIssues.push("payment_memo_not_order");
     if (offer.merchantProof.badge !== offer.merchant.badge) merchantIssues.push("merchant_proof_badge_mismatch");
     // The challenge we are asked to sign must be for this merchant, this session and this order;
     // otherwise we could be made to produce a proof that works somewhere else.

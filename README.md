@@ -23,7 +23,7 @@ It plugs into any agent through an **MCP server** (`signet_buy`, `signet_audit`,
 
 ```bash
 npm install
-npm test          # 118 tests: mandate engine, ledger, anchors, receipts, directory, protocol attacks, SDK signing
+npm test          # 132 tests: mandate engine, ledger, anchors, receipts, order memos, directory, protocol attacks, SDK signing
 npm run demo      # 7-scenario shopping demo on a local mock of Concordium
 ```
 
@@ -43,7 +43,7 @@ What the merchant and buyer each check before money moves:
 
 - **Merchant:** buyer badge and proof of control for this session and order; the owner-signed mandate (signature, published hash, agent, validity); its own mandate decision on the order, using the agent's signed spend-so-far (never below what the merchant has already received); an owner-signed approval when the mandate says ask; the age proof; payer = proven account. Each order and each signed payment is accepted once.
 - **Buyer:** merchant badge and proof of control; a listing in the signed merchant directory that binds badge, brand, domain (DNS TXT proof) and endpoint; every quoted line at its listed price and category, exactly the items asked for; its own mandate and the owner's approval.
-- **Anyone:** `verifyReceipt()` checks a receipt's merchant signature, the log entry that commits to it, the Merkle path to the anchored root, the anchor transaction's sender and contents, and the payment on chain.
+- **Anyone:** `verifyReceipt()` checks a receipt's merchant signature, the log entry that commits to it, the Merkle path to the anchored root, the anchor transaction's sender and contents, and the payment on chain, whose transfer memo must name the receipt's order (`signet:<orderHash>`).
 
 ## Use from Claude / any MCP client
 

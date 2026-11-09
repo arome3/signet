@@ -1,11 +1,13 @@
 import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { AccountAddress, DataBlob, SequenceNumber, TransactionExpiry, buildAccountSigner, signMessage, verifyMessageSignature } from "@concordium/web-sdk";
+import { AccountAddress, CborMemo, CcdAmount, DataBlob, SequenceNumber, TransactionExpiry, buildAccountSigner, signMessage, verifyMessageSignature } from "@concordium/web-sdk";
 import { Transaction } from "@concordium/web-sdk/transactions";
 import { challengeMessage, newChallenge } from "../src/core/challenge.js";
 import { encodeAnchor } from "../src/core/anchor.js";
 import { sha256Hex } from "../src/core/canonical.js";
 import { serializeAccountSignature } from "../src/concordium/account.js";
+import { ccdTransferWithMemo, memoOfSignedTransaction, pltTransferWithMemo } from "../src/concordium/rail.js";
+import { encodeMemo, orderMemo } from "../src/core/memo.js";
 import { agentTokenIdParam, parseWalletNonce, setAgentWalletMessage } from "../src/concordium/agent-wallet.js";
 
 /** Real Concordium SDK code paths that do not need a node: message signing and tx construction. */
@@ -98,5 +100,32 @@ describe("CIS-8004 setAgentWallet message (deployed contract layout)", () => {
     expect(parseWalletNonce(Buffer.from("010000000000000000", "hex"))).toBe(0n);
     expect(() => parseWalletNonce(Buffer.from("000000000000000000", "hex"))).toThrow(/unexpected/);
     expect(agentTokenIdParam(1060n).toString("hex")).toBe("082404000000000000");
+  });
+});
+
+describe("order memo on the x402 payment transfer (real SDK, no node)", () => {
+  const memo = orderMemo(sha256Hex("order"));
+  const meta = { sender: A, nonce: SequenceNumber.create(1n), expiry: TransactionExpiry.futureMinutes(5) };
+  /** Sign as the x402 client does and round-trip through JSON, as the payment header carries it. */
+  async function signedJson(builder: { addMetadata: Function }) {
+    const signable = (builder as any).addMetadata(meta).addSponsor(S).build();
+    const signed = await Transaction.sign(signable, buildAccountSigner(keypair().priv));
+    return JSON.parse(JSON.stringify(Transaction.toJSON(signed), (_k, v) => (typeof v === "bigint" ? v.toString() : v)));
+  }
+
+  it("encodes the memo exactly as the SDK's CBOR string memo does", () => {
+    expect(Buffer.from(encodeMemo(memo)).toString("hex")).toBe(Buffer.from(CborMemo.fromString(memo).content).toString("hex"));
+  });
+
+  it("reads the memo back from a signed CCD transfer and a signed PLT transfer", async () => {
+    expect(memoOfSignedTransaction(await signedJson(ccdTransferWithMemo(S.address, "20000000", memo)))).toBe(memo);
+    expect(memoOfSignedTransaction(await signedJson(pltTransferWithMemo(S.address, "2000", "EURD", 2, memo)))).toBe(memo);
+  });
+
+  it("reads no memo from a plain transfer or junk, so an expected memo fails closed", async () => {
+    const plain = Transaction.transfer({ toAddress: S, amount: CcdAmount.fromMicroCcd(1n) });
+    expect(memoOfSignedTransaction(await signedJson(plain))).toBeUndefined();
+    expect(memoOfSignedTransaction({ payload: { type: "tokenUpdate", operations: "zz" } })).toBeUndefined();
+    expect(memoOfSignedTransaction(undefined)).toBeUndefined();
   });
 });
