@@ -2,8 +2,8 @@ import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { AutoConsent } from "../src/core/consent.js";
 import { AuditLedger } from "../src/core/ledger.js";
-import { parseMandate, type Mandate } from "../src/core/mandate.js";
-import type { ConsentProvider } from "../src/core/types.js";
+import { mandateHash, parseMandate, signMandate, type Mandate } from "../src/core/mandate.js";
+import type { ConsentProvider, ConsentRequest } from "../src/core/types.js";
 import { SignetBuyer, type PurchaseOutcome } from "../src/buyer/agent.js";
 import { createMerchantApp, type CatalogItem } from "../src/seller/merchant.js";
 import { MockWorld } from "../src/mock/world.js";
@@ -50,7 +50,7 @@ async function listen(app: ReturnType<typeof createMerchantApp>): Promise<{ url:
  *  - "FreshMart" impostor: registered, but its Agent Card was tampered with.
  *  - Teen-owned agent and an unregistered rogue script.
  */
-export async function buildMockScenario(opts: { consent?: ConsentProvider } = {}) {
+export async function buildMockScenario(opts: { consent?: ConsentProvider; approve?: boolean | ((r: ConsentRequest) => boolean) } = {}) {
   const world = new MockWorld();
 
   const ada = world.createAccount("human", { dob: "1995-04-12" });
@@ -102,31 +102,35 @@ export async function buildMockScenario(opts: { consent?: ConsentProvider } = {}
   const fakeSrv = await listen(fakeApp);
 
   const kitLedger = new AuditLedger();
+  // Ada signs Kit's mandate with her own account and publishes its hash on Kit's badge.
   const mandate = adaMandate(kitBadge, ada.address);
-  world.agents.get(kitBadge)!.metadata["signet.mandate"] = "pending";
+  const signedMandate = await signMandate(mandate, world.prover(ada.address));
+  world.publishMandate(kitBadge, mandateHash(mandate));
   const kit = new SignetBuyer({
     badge: kitBadge,
-    mandate,
+    mandate: signedMandate,
     prover: world.prover(kitAccount.address),
     attributes: world.attributeProver(kitAccount.address),
     rail: world.rail(kitAccount.address),
     registry: world.registry(),
     verifier: world.verifier(),
-    consent: opts.consent ?? new AutoConsent(true),
+    // Simulated Ada: approves and signs with her key, so FreshMart can check the approval itself.
+    consent: opts.consent ?? new AutoConsent(opts.approve ?? true, world.prover(ada.address)),
     ledger: kitLedger,
   });
-  world.agents.get(kitBadge)!.metadata["signet.mandate"] = kit.mandateHash;
   kitLedger.append({ type: "mandate_published", actor: kitBadge, data: { mandate: kit.mandateHash, owner: ada.address, asset: mandate.asset, perPaymentLimit: mandate.perPaymentLimit, dailyLimit: mandate.dailyLimit } });
 
+  const teenMandate = adaMandate(teenBadge, teen.address);
+  world.publishMandate(teenBadge, mandateHash(teenMandate));
   const teenAgent = new SignetBuyer({
     badge: teenBadge,
-    mandate: adaMandate(teenBadge, teen.address),
+    mandate: await signMandate(teenMandate, world.prover(teen.address)),
     prover: world.prover(teen.address),
     attributes: world.attributeProver(teen.address),
     rail: world.rail(teen.address),
     registry: world.registry(),
     verifier: world.verifier(),
-    consent: new AutoConsent(true),
+    consent: new AutoConsent(true, world.prover(teen.address)),
     ledger: new AuditLedger(),
   });
 
@@ -135,7 +139,7 @@ export async function buildMockScenario(opts: { consent?: ConsentProvider } = {}
     fakeSrv.server.close();
   };
 
-  return { world, ada, kitAccount, kitBadge, kit, kitLedger, shop, shopBadge, shopUrl: shopSrv.url, fakeUrl: fakeSrv.url, merchantLedger, teenAgent, teenBadge, close };
+  return { world, ada, kitAccount, kitBadge, kit, kitLedger, signedMandate, shop, shopBadge, shopUrl: shopSrv.url, fakeUrl: fakeSrv.url, merchantLedger, teenAgent, teenBadge, close };
 }
 
 export type Scenario = Awaited<ReturnType<typeof buildMockScenario>>;

@@ -111,10 +111,20 @@ export class AuditLedger {
     return this.entries.filter((e) => e.orderId === orderId);
   }
 
+  /** Buyer side: what `actor` has paid out today in `asset`. */
   spentToday(actor: string, asset: string, now = new Date()): bigint {
+    return this.settledToday((e) => e.actor === actor && e.data.direction !== "in", asset, now);
+  }
+
+  /** Merchant side: what this ledger has received today from the buyer badge `from`. */
+  receivedToday(from: string, asset: string, now = new Date()): bigint {
+    return this.settledToday((e) => e.data.direction === "in" && e.data.buyer === from, asset, now);
+  }
+
+  private settledToday(match: (e: LedgerEntry) => boolean, asset: string, now: Date): bigint {
     const day = now.toISOString().slice(0, 10);
     return this.entries
-      .filter((e) => e.type === "payment_settled" && e.actor === actor && e.data.asset === asset && e.ts.startsWith(day))
+      .filter((e) => e.type === "payment_settled" && e.data.asset === asset && e.ts.startsWith(day) && match(e))
       .reduce((sum, e) => sum + BigInt(String(e.data.amount)), 0n);
   }
 }

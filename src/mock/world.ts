@@ -75,6 +75,13 @@ export class MockWorld {
     return badge;
   }
 
+  /** Sets the badge's `signet.mandate` metadata (the owner publishes the mandate hash). */
+  publishMandate(badge: string, hash: string) {
+    const r = this.agents.get(badge);
+    if (!r) throw new Error(`unknown mock badge ${badge}`);
+    r.metadata["signet.mandate"] = hash;
+  }
+
   revoke(badge: string) {
     const r = this.agents.get(badge);
     if (r) r.active = false;

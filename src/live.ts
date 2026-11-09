@@ -1,5 +1,5 @@
 import { AuditLedger } from "./core/ledger.js";
-import { parseMandate, type Mandate } from "./core/mandate.js";
+import { loadSignedMandate } from "./core/mandate-file.js";
 import { TerminalConsent } from "./core/consent.js";
 import type { ConsentProvider } from "./core/types.js";
 import { SignetBuyer } from "./buyer/agent.js";
@@ -10,7 +10,6 @@ import { grpcClient, loadConfig, loadWalletExport } from "./concordium/config.js
 import { ConcordiumAttributeVerifier, createAgeRequest } from "./concordium/identity.js";
 import { ConcordiumRail } from "./concordium/rail.js";
 import { ConcordiumRegistry } from "./concordium/registry.js";
-import { readFileSync } from "node:fs";
 
 /**
  * Wires Signet to Concordium testnet from environment variables (see .env.example).
@@ -29,7 +28,11 @@ export function liveBuyer(opts: { consent?: ConsentProvider; ledgerFile?: string
   const agent = loadWalletExport(need("AGENT_WALLET_FILE"));
   const sponsor = process.env.ANCHOR_SPONSOR_WALLET_FILE ? loadWalletExport(process.env.ANCHOR_SPONSOR_WALLET_FILE) : undefined;
   const badge = need("AGENT_BADGE");
-  const mandate: Mandate = parseMandate({ ...JSON.parse(readFileSync(need("MANDATE_FILE"), "utf8")), agent: badge });
+  // Signed by the owner with `npm run mandate:sign`; its hash must be the badge's `signet.mandate` metadata.
+  const mandate = loadSignedMandate(process.env.SIGNED_MANDATE_FILE ?? "out/mandate.signed.json", badge);
+  // Optional: the owner's key, so a "y" at the terminal is a signed approval merchants can verify.
+  // Without it, orders that need approval are refused by merchants (fail closed) until ID App approval lands.
+  const owner = process.env.OWNER_WALLET_FILE ? loadWalletExport(process.env.OWNER_WALLET_FILE) : undefined;
   const ledger = new AuditLedger(opts.ledgerFile ?? process.env.AGENT_LEDGER_FILE ?? "out/agent-ledger.jsonl");
   const buyer = new SignetBuyer({
     badge,
@@ -40,7 +43,7 @@ export function liveBuyer(opts: { consent?: ConsentProvider; ledgerFile?: string
     rail: new ConcordiumRail(cfg, { payer: agent }),
     registry: new ConcordiumRegistry(cfg, grpc),
     verifier: new ConcordiumAccountVerifier(grpc),
-    consent: opts.consent ?? new TerminalConsent(),
+    consent: opts.consent ?? new TerminalConsent(owner ? new ConcordiumAccountProver(owner) : undefined),
     ledger,
   });
   return { cfg, grpc, buyer, ledger, badge, anchorSink: new ConcordiumAnchorSink(cfg, grpc, agent, sponsor) };

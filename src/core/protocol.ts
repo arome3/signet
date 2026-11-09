@@ -1,4 +1,5 @@
 import type { BadgeProof, Challenge } from "./challenge.js";
+import type { SignedMandate, SignedSpend } from "./mandate.js";
 import type { AttributeProof, ConsentResult } from "./types.js";
 
 /**
@@ -15,10 +16,12 @@ import type { AttributeProof, ConsentResult } from "./types.js";
  *      -> POST /orders/:id/pay with
  *         PAYMENT-SIGNATURE (x402 payload, sponsored Concordium transfer, sender-signed)
  *         X-SIGNET-PROOF   (BadgeProof over the seller challenge)
+ *         X-SIGNET-MANDATE (MandateHeader: owner-signed mandate + agent-signed spend-so-far)
  *         X-SIGNET-ATTEST  (AttributeProof[])
- *         X-SIGNET-CONSENT (ConsentResult, when consent was needed)
- *   4. Seller verifies the buyer agent, then verifies+settles via the facilitator and returns
- *      200 with PAYMENT-RESPONSE and the receipt.
+ *         X-SIGNET-CONSENT (ConsentResult with the owner's signature, when consent was needed)
+ *   4. Seller re-checks everything itself (buyer proof, mandate signature and published hash,
+ *      mandate decision on its own order, spend-so-far, owner approval, age, payer), then
+ *      verifies+settles via the facilitator and returns 200 with PAYMENT-RESPONSE and the receipt.
  */
 export const H = {
   paymentRequired: "PAYMENT-REQUIRED",
@@ -29,7 +32,13 @@ export const H = {
   proof: "X-SIGNET-PROOF",
   attest: "X-SIGNET-ATTEST",
   consent: "X-SIGNET-CONSENT",
+  mandate: "X-SIGNET-MANDATE",
 } as const;
+
+export interface MandateHeader {
+  mandate: SignedMandate;
+  spend: SignedSpend;
+}
 
 export interface OrderLine {
   sku: string;

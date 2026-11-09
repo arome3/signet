@@ -1,5 +1,9 @@
 import { z } from "zod";
 import { hashOf } from "./canonical.js";
+import { type AccountSignature, signAs, verifySigned } from "./signing.js";
+import type { AccountProver, AccountVerifier } from "./types.js";
+
+const isoDate = z.string().refine((s) => !Number.isNaN(Date.parse(s)), "not an ISO date");
 
 /**
  * A Mandate is the owner's signed statement of what their agent may do with money.
@@ -38,8 +42,10 @@ export const MandateSchema = z.object({
       allowlist: z.array(z.string()).default([]),
     })
     .default({}),
+  /** ISO timestamp before which the mandate is not yet in force (optional). */
+  validFrom: isoDate.optional(),
   /** ISO timestamp after which the mandate is void. */
-  validUntil: z.string(),
+  validUntil: isoDate,
 });
 
 export type Mandate = z.infer<typeof MandateSchema>;
@@ -90,7 +96,9 @@ export function evaluateMandate(
   const consent: string[] = [];
   const projected = spentToday + intent.amount;
 
-  if (now.getTime() > Date.parse(m.validUntil)) deny.push("mandate_expired");
+  const until = Date.parse(m.validUntil);
+  if (Number.isNaN(until) || now.getTime() > until) deny.push("mandate_expired");
+  if (m.validFrom !== undefined && !(now.getTime() >= Date.parse(m.validFrom))) deny.push("mandate_not_yet_valid");
   if (intent.asset !== m.asset) deny.push("asset_not_allowed");
   if (intent.amount > BigInt(m.hardLimit)) deny.push("hard_limit_exceeded");
 
@@ -119,4 +127,94 @@ export function formatAmount(atomic: bigint | string, decimals = 6, symbol = "")
   const whole = v / base;
   const frac = (v % base).toString().padStart(decimals, "0").replace(/0+$/, "");
   return `${whole}${frac ? "." + frac : ""}${symbol ? " " + symbol : ""}`;
+}
+
+// ---- Owner signature -------------------------------------------------------------------------
+
+/**
+ * A mandate plus the owner's signature over its hash. The agent holds this and shows it to every
+ * merchant (header X-SIGNET-MANDATE); the hash alone is published in the badge's CIS-8004 metadata.
+ * Changing any limit changes the hash, so the agent cannot raise its own limits.
+ */
+export interface SignedMandate {
+  mandate: Mandate;
+  ownerSignature: AccountSignature;
+}
+
+export async function signMandate(m: Mandate, owner: AccountProver): Promise<SignedMandate> {
+  if (owner.account !== m.owner) throw new Error("only the account named as the mandate's owner can sign it");
+  return { mandate: m, ownerSignature: await signAs(owner, "signet-mandate", { mandateHash: mandateHash(m) }) };
+}
+
+/**
+ * Checks a signed mandate received from anywhere (fail closed: malformed input is an issue, never
+ * an exception). `publishedHash` is the `signet.mandate` value from the agent's registry entry; when
+ * it is missing the mandate is refused, because nothing ties it to the badge.
+ */
+export async function checkSignedMandate(
+  input: unknown,
+  expected: { agent: string; publishedHash: string | undefined },
+  verifier: AccountVerifier,
+): Promise<{ issues: string[]; mandate?: Mandate; hash?: string }> {
+  const sm = input as Partial<SignedMandate> | undefined;
+  const parsed = MandateSchema.safeParse(sm?.mandate);
+  if (!sm || !parsed.success) return { issues: ["mandate_malformed"] };
+  const mandate = parsed.data;
+  const hash = mandateHash(mandate);
+  const issues: string[] = [];
+  if (sm.ownerSignature?.account !== mandate.owner) issues.push("mandate_signer_not_owner");
+  else if (!(await verifySigned(verifier, sm.ownerSignature, "signet-mandate", { mandateHash: hash }))) issues.push("mandate_bad_signature");
+  if (mandate.agent !== expected.agent) issues.push("mandate_wrong_agent");
+  if (!expected.publishedHash) issues.push("mandate_not_published");
+  else if (expected.publishedHash !== hash) issues.push("mandate_hash_not_published_value");
+  return { issues, mandate, hash };
+}
+
+// ---- Spend-so-far statement ------------------------------------------------------------------
+
+/**
+ * The agent's signed statement of what it has already paid today, bound to one order. The merchant
+ * cannot see the agent's payments at other merchants, so this is an attested figure: the merchant
+ * checks it is signed by the agent's proven account, is for today and this order, and is not below
+ * what the merchant itself has received from the agent today. A false statement is signed evidence.
+ */
+export interface SpendStatement {
+  agent: string;
+  asset: string;
+  /** UTC day, YYYY-MM-DD. */
+  day: string;
+  /** Atomic units already settled today, before this order. */
+  spent: string;
+  orderHash: string;
+}
+
+export interface SignedSpend {
+  statement: SpendStatement;
+  signature: AccountSignature;
+}
+
+export const utcDay = (d = new Date()) => d.toISOString().slice(0, 10);
+
+export async function signSpend(s: SpendStatement, agentAccount: AccountProver): Promise<SignedSpend> {
+  return { statement: s, signature: await signAs(agentAccount, "signet-spend", s) };
+}
+
+/** Returns issues, plus the attested amount when the statement is usable. */
+export async function checkSpend(
+  input: unknown,
+  expected: { agent: string; asset: string; orderHash: string; account: string; atLeast: bigint; now?: Date },
+  verifier: AccountVerifier,
+): Promise<{ issues: string[]; spent?: bigint }> {
+  const s = input as Partial<SignedSpend> | undefined;
+  const st = s?.statement;
+  if (!st || typeof st.spent !== "string" || !/^\d+$/.test(st.spent)) return { issues: ["spend_statement_malformed"] };
+  const issues: string[] = [];
+  if (st.agent !== expected.agent) issues.push("spend_wrong_agent");
+  if (st.asset !== expected.asset) issues.push("spend_wrong_asset");
+  if (st.day !== utcDay(expected.now)) issues.push("spend_wrong_day");
+  if (st.orderHash !== expected.orderHash) issues.push("spend_wrong_order");
+  if (!(await verifySigned(verifier, s.signature, "signet-spend", st, [expected.account]))) issues.push("spend_bad_signature");
+  const spent = BigInt(st.spent);
+  if (spent < expected.atLeast) issues.push("spend_understated");
+  return { issues, spent };
 }

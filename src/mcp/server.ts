@@ -14,7 +14,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { anchorPending, type AnchorSink } from "../core/anchor.js";
-import { AutoConsent } from "../core/consent.js";
 import type { AuditLedger } from "../core/ledger.js";
 import { formatAmount } from "../core/mandate.js";
 import { accountabilityReport } from "../core/report.js";
@@ -40,7 +39,7 @@ if (mode === "live") {
 } else {
   const { buildMockScenario } = await import("../../demo/scenario.js");
   // In mock mode consent is simulated: approve up to 100 USDR. Live mode asks the real owner.
-  const s = await buildMockScenario({ consent: new AutoConsent((r) => r.amount <= 100_000_000n) });
+  const s = await buildMockScenario({ approve: (r) => r.amount <= 100_000_000n });
   buyer = s.kit;
   ledger = s.kitLedger;
   badge = s.kitBadge;

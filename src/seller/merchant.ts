@@ -3,8 +3,10 @@ import { decodePaymentSignatureHeader, encodePaymentRequiredHeader, encodePaymen
 import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402/core/types";
 import { hashOf, randomHex } from "../core/canonical.js";
 import { type BadgeProof, type Challenge, checkBadgeProof, decodeHeader, newChallenge, proveBadge } from "../core/challenge.js";
+import { checkApproval } from "../core/consent.js";
 import type { AuditLedger } from "../core/ledger.js";
-import { H, type Order, type OrderLine, type Receipt, type SignetOffer } from "../core/protocol.js";
+import { checkSignedMandate, checkSpend, evaluateMandate, type MandateEvaluation } from "../core/mandate.js";
+import { H, type MandateHeader, type Order, type OrderLine, type Receipt, type SignetOffer } from "../core/protocol.js";
 import type { AccountProver, AccountVerifier, AgentRegistry, AttributeProof, AttributeVerifier, ConsentResult, PaymentRail } from "../core/types.js";
 
 export interface CatalogItem {
@@ -159,6 +161,48 @@ export function createMerchantApp(cfg: SellerConfig) {
     if (!verdict.verified) issues.push("buyer_not_verified", ...verdict.issues);
     issues.push(...(await checkBadgeProof(proof, { audience: cfg.badge, orderHash: p.orderHash, nonce: p.challenge.nonce }, [verdict.owner, verdict.agentWallet], cfg.verifier)));
 
+    // The owner's mandate, checked here as well: a compromised buyer runtime that skips its own
+    // mandate check still cannot get paid outside the owner's limits.
+    const mandateHeader = decodeHeader<MandateHeader>(req.header(H.mandate));
+    let mandateCheck: { hash?: string; evaluation?: MandateEvaluation } = {};
+    if (!mandateHeader) issues.push("mandate_missing");
+    else {
+      const m = await checkSignedMandate(mandateHeader.mandate, { agent: p.buyerBadge, publishedHash: verdict.mandateHash }, cfg.verifier);
+      issues.push(...m.issues);
+      if (m.mandate && m.issues.length === 0) {
+        const spend = await checkSpend(
+          mandateHeader.spend,
+          { agent: p.buyerBadge, asset: m.mandate.asset, orderHash: p.orderHash, account: proof.account, atLeast: cfg.ledger.receivedToday(p.buyerBadge, m.mandate.asset) },
+          cfg.verifier,
+        );
+        issues.push(...spend.issues);
+        if (spend.spent !== undefined && spend.issues.length === 0) {
+          const self = await cfg.registry.check(cfg.badge);
+          const evaluation = evaluateMandate(
+            m.mandate,
+            {
+              merchant: { badge: cfg.badge, verified: self.verified, business: self.ownerKind === "business" },
+              asset: p.requirements.asset,
+              amount: BigInt(p.requirements.amount),
+              categories: p.order.categories,
+              description: p.order.lines.map((l) => `${l.qty}x ${l.name}`).join(", "),
+            },
+            spend.spent,
+          );
+          mandateCheck = { hash: m.hash, evaluation };
+          if (evaluation.decision === "deny") issues.push(...evaluation.reasons.map((r) => `mandate:${r}`));
+          if (evaluation.decision === "consent") {
+            const approval = await checkApproval(
+              consent,
+              { owner: m.mandate.owner, agent: p.buyerBadge, orderHash: p.orderHash, merchant: cfg.badge, amount: p.requirements.amount, asset: p.requirements.asset },
+              cfg.verifier,
+            );
+            issues.push(...approval);
+          }
+        }
+      }
+    }
+
     // Age-restricted goods: zero-knowledge proof about the accountable owner.
     if (p.ageOver) {
       const a = attest.find((x) => x.kind === "age_over" && x.threshold >= p.ageOver!);
@@ -172,7 +216,21 @@ export function createMerchantApp(cfg: SellerConfig) {
     else if (v.payer !== proof.account) issues.push("payer_not_badge_account");
 
     if (issues.length) return reject(res, 403, issues, orderId, proof.badge);
-    cfg.ledger.append({ type: "payment_verified", actor: cfg.badge, orderId, data: { buyer: proof.badge, payer: v.payer, ageOver: p.ageOver, consent: consent ? { method: consent.method, textHash: consent.textHash, auditAnchorTx: consent.auditAnchorTx } : undefined } });
+    cfg.ledger.append({
+      type: "payment_verified",
+      actor: cfg.badge,
+      orderId,
+      data: {
+        buyer: proof.badge,
+        payer: v.payer,
+        ageOver: p.ageOver,
+        mandate: mandateCheck.hash,
+        mandateDecision: mandateCheck.evaluation?.decision,
+        mandateReasons: mandateCheck.evaluation?.reasons,
+        spentBefore: mandateCheck.evaluation?.spentToday,
+        consent: consent ? { method: consent.method, textHash: consent.textHash, auditAnchorTx: consent.auditAnchorTx } : undefined,
+      },
+    });
 
     const s = await cfg.rail.settle(payment, p.requirements);
     if (!s.success) return reject(res, 402, [`settlement_failed:${s.errorReason}`], orderId, proof.badge);

@@ -2,9 +2,9 @@ import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePayment
 import type { PaymentRequired } from "@x402/core/types";
 import { hashOf, randomHex } from "../core/canonical.js";
 import { checkBadgeProof, encodeHeader, proveBadge } from "../core/challenge.js";
-import { evaluateMandate, type Mandate, type MandateEvaluation, mandateHash } from "../core/mandate.js";
+import { checkSignedMandate, evaluateMandate, type MandateEvaluation, mandateHash, type SignedMandate, signSpend, utcDay } from "../core/mandate.js";
 import type { AuditLedger } from "../core/ledger.js";
-import { H, type Receipt, type SignetOffer } from "../core/protocol.js";
+import { H, type MandateHeader, type Receipt, type SignetOffer } from "../core/protocol.js";
 import type {
   AccountProver,
   AccountVerifier,
@@ -19,7 +19,8 @@ import type {
 
 export interface BuyerConfig {
   badge: string;
-  mandate: Mandate;
+  /** The owner-signed mandate. Its hash must be the badge's published `signet.mandate` value. */
+  mandate: SignedMandate;
   /** Signs challenges with the account the registry binds to this badge. */
   prover: AccountProver;
   attributes?: AttributeProver;
@@ -47,16 +48,28 @@ export class SignetBuyer {
   }
 
   get mandateHash() {
-    return mandateHash(this.cfg.mandate);
+    return mandateHash(this.cfg.mandate.mandate);
+  }
+
+  private get mandate() {
+    return this.cfg.mandate.mandate;
   }
 
   spentToday(): bigint {
-    return this.cfg.ledger.spentToday(this.cfg.badge, this.cfg.mandate.asset);
+    return this.cfg.ledger.spentToday(this.cfg.badge, this.mandate.asset);
   }
 
   async purchase(merchantUrl: string, items: { sku: string; qty: number }[]): Promise<PurchaseOutcome> {
     const { badge, ledger } = this.cfg;
     const nonce = randomHex(16);
+
+    // 0. Our own mandate must be owner-signed and match what the badge publishes, or we do not shop.
+    const own = await this.cfg.registry.check(badge);
+    const mandateIssues = (await checkSignedMandate(this.cfg.mandate, { agent: badge, publishedHash: own.mandateHash }, this.cfg.verifier)).issues;
+    if (mandateIssues.length) {
+      ledger.append({ type: "mandate_check", actor: badge, data: { decision: "deny", reasons: mandateIssues, mandate: this.mandateHash } });
+      return { status: "denied", stage: "mandate", reasons: mandateIssues };
+    }
 
     // 1. Ask for an offer.
     const res = await this.f(new URL("/orders", merchantUrl), {
@@ -92,7 +105,7 @@ export class SignetBuyer {
 
     // 3. Mandate.
     const evaluation = evaluateMandate(
-      this.cfg.mandate,
+      this.mandate,
       {
         merchant: { badge: merchant.badge, verified: merchantOk, business: merchant.ownerKind === "business" },
         asset: req.asset,
@@ -110,8 +123,9 @@ export class SignetBuyer {
     if (evaluation.decision === "consent") {
       const creq = {
         orderId,
+        orderHash: offer.orderHash,
         agent: badge,
-        owner: this.cfg.mandate.owner,
+        owner: this.mandate.owner,
         merchantBadge: merchant.badge,
         merchantName: offer.merchant.name,
         amount: BigInt(req.amount),
@@ -132,6 +146,8 @@ export class SignetBuyer {
       if (!this.cfg.attributes) return { status: "denied", stage: "seller", reasons: ["age_proof_required_but_no_prover"], evaluation };
       attest.push(await this.cfg.attributes.prove("age_over", offer.requires.ageOver, offer.challenge.nonce, offer.requires.ageRequest));
     }
+    const spend = await signSpend({ agent: badge, asset: this.mandate.asset, day: utcDay(), spent: evaluation.spentToday.toString(), orderHash: offer.orderHash }, this.cfg.prover);
+    const mandateHeader: MandateHeader = { mandate: this.cfg.mandate, spend };
     const payment = await this.cfg.rail.createPayment(req);
     ledger.append({ type: "payment_signed", actor: badge, orderId, data: { amount: req.amount, asset: req.asset, payTo: req.payTo, network: req.network } });
 
@@ -141,6 +157,7 @@ export class SignetBuyer {
         [H.paymentSignature]: encodePaymentSignatureHeader(payment),
         [H.proof]: encodeHeader(proof),
         [H.attest]: encodeHeader(attest),
+        [H.mandate]: encodeHeader(mandateHeader),
         ...(consent ? { [H.consent]: encodeHeader(consent) } : {}),
       },
     });

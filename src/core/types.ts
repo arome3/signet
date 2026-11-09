@@ -1,3 +1,4 @@
+import type { AccountSignature } from "./signing.js";
 import type { PaymentPayload, PaymentRequirements, SettleResponse, VerifyResponse } from "@x402/core/types";
 
 export type OwnerKind = "human" | "business" | "agent" | "unknown";
@@ -40,6 +41,8 @@ export interface AccountVerifier {
 
 export interface ConsentRequest {
   orderId: string;
+  /** Hash of the merchant's order; the owner's approval is bound to it. */
+  orderHash: string;
   agent: string;
   owner: string;
   merchantBadge: string;
@@ -59,6 +62,12 @@ export interface ConsentResult {
   auditAnchorTx?: string;
   /** Hash of the consent text the owner saw. */
   textHash: string;
+  /**
+   * Owner's signature over the approval (see approvalPayload). This is what lets a merchant verify the
+   * approval independently. Live ID App approvals carry CCDVRA/CCDVAA anchors instead; merchants
+   * cannot check those yet, so they refuse them (fail closed) until that check is built.
+   */
+  ownerSignature?: AccountSignature;
 }
 
 export interface ConsentProvider {
