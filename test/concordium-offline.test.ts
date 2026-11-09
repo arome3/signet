@@ -5,6 +5,7 @@ import { Transaction } from "@concordium/web-sdk/transactions";
 import { challengeMessage, newChallenge } from "../src/core/challenge.js";
 import { encodeAnchor } from "../src/core/anchor.js";
 import { sha256Hex } from "../src/core/canonical.js";
+import { serializeAccountSignature } from "../src/concordium/account.js";
 
 /** Real Concordium SDK code paths that do not need a node: message signing and tx construction. */
 function keypair() {
@@ -47,5 +48,18 @@ describe("Concordium SDK integration (offline)", () => {
     const fin = Transaction.finalize(sponsored);
     expect(Transaction.getAccountTransactionHash(fin)).toHaveLength(32);
     expect((sponsored as any).signatures.sponsor).toBeDefined();
+  });
+});
+
+describe("AccountSignatures wire form (for CIS-8004 setAgentWallet)", () => {
+  it("serializes one credential with one key as count, index, count, index, Ed25519 tag, 64 bytes", () => {
+    const sig = "ab".repeat(64);
+    expect(serializeAccountSignature({ 0: { 0: sig } })).toBe("01" + "00" + "01" + "00" + "00" + sig);
+  });
+
+  it("orders credentials and keys by index and refuses anything that is not a 64-byte signature", () => {
+    const [a, b, c] = ["aa", "bb", "cc"].map((x) => x.repeat(64));
+    expect(serializeAccountSignature({ 1: { 0: c }, 0: { 2: b, 0: a } })).toBe("02" + "00" + "02" + "0000" + a + "0200" + b + "01" + "01" + "0000" + c);
+    expect(() => serializeAccountSignature({ 0: { 0: "abcd" } })).toThrow(/64-byte/);
   });
 });

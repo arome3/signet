@@ -113,9 +113,9 @@ export class SignetBuyer {
     const { badge, ledger } = this.cfg;
     const nonce = randomHex(16);
 
-    // 0. Our own mandate must be owner-signed and match what the badge publishes, or we do not shop.
+    // 0. Our own mandate must be signed by our badge's owner and match what the badge publishes, or we do not shop.
     const own = await this.cfg.registry.check(badge);
-    const mandateIssues = (await checkSignedMandate(this.cfg.mandate, { agent: badge, publishedHash: own.mandateHash }, this.cfg.verifier)).issues;
+    const mandateIssues = (await checkSignedMandate(this.cfg.mandate, { agent: badge, owner: own.owner, publishedHash: own.mandateHash }, this.cfg.verifier)).issues;
     if (mandateIssues.length) {
       ledger.append({ type: "mandate_check", actor: badge, data: { decision: "deny", reasons: mandateIssues, mandate: this.mandateHash } });
       return { status: "denied", stage: "mandate", reasons: mandateIssues };

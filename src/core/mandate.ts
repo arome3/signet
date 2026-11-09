@@ -148,12 +148,16 @@ export async function signMandate(m: Mandate, owner: AccountProver): Promise<Sig
 
 /**
  * Checks a signed mandate received from anywhere (fail closed: malformed input is an issue, never
- * an exception). `publishedHash` is the `signet.mandate` value from the agent's registry entry; when
- * it is missing the mandate is refused, because nothing ties it to the badge.
+ * an exception). Both values come from the agent's registry entry:
+ *   - `publishedHash` is its `signet.mandate` metadata; when missing the mandate is refused, because
+ *     nothing ties it to the badge.
+ *   - `owner` is the badge's CIS-2 owner, the only account the contract lets write that metadata. The
+ *     mandate must name it as owner: otherwise an agent that owns its own badge could invent an "owner",
+ *     have that throwaway key sign any limits, and publish the hash itself.
  */
 export async function checkSignedMandate(
   input: unknown,
-  expected: { agent: string; publishedHash: string | undefined },
+  expected: { agent: string; owner: string | undefined; publishedHash: string | undefined },
   verifier: AccountVerifier,
 ): Promise<{ issues: string[]; mandate?: Mandate; hash?: string }> {
   const sm = input as Partial<SignedMandate> | undefined;
@@ -162,6 +166,7 @@ export async function checkSignedMandate(
   const mandate = parsed.data;
   const hash = mandateHash(mandate);
   const issues: string[] = [];
+  if (!expected.owner || mandate.owner !== expected.owner) issues.push("mandate_owner_not_badge_owner");
   if (sm.ownerSignature?.account !== mandate.owner) issues.push("mandate_signer_not_owner");
   else if (!(await verifySigned(verifier, sm.ownerSignature, "signet-mandate", { mandateHash: hash }))) issues.push("mandate_bad_signature");
   if (mandate.agent !== expected.agent) issues.push("mandate_wrong_agent");

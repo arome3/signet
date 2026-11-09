@@ -210,7 +210,7 @@ export function createMerchantApp(cfg: SellerConfig) {
     let mandateCheck: { hash?: string; evaluation?: MandateEvaluation } = {};
     if (!mandateHeader) issues.push("mandate_missing");
     else {
-      const m = await checkSignedMandate(mandateHeader.mandate, { agent: p.buyerBadge, publishedHash: verdict.mandateHash }, cfg.verifier);
+      const m = await checkSignedMandate(mandateHeader.mandate, { agent: p.buyerBadge, owner: verdict.owner, publishedHash: verdict.mandateHash }, cfg.verifier);
       issues.push(...m.issues);
       if (m.mandate && m.issues.length === 0) {
         const spend = await checkSpend(

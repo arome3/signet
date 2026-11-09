@@ -83,10 +83,14 @@ export class MockWorld {
     return badge;
   }
 
-  /** Sets the badge's `signet.mandate` metadata (the owner publishes the mandate hash). */
-  publishMandate(badge: string, hash: string) {
+  /**
+   * Sets the badge's `signet.mandate` metadata. Like CIS-8004 `setMetadata`, only the token's current
+   * owner may do this; the agentWallet cannot.
+   */
+  publishMandate(badge: string, hash: string, sender: string) {
     const r = this.agents.get(badge);
     if (!r) throw new Error(`unknown mock badge ${badge}`);
+    if (sender !== r.owner) throw new Error("Unauthorized: only the badge owner can set metadata");
     r.metadata["signet.mandate"] = hash;
   }
 
