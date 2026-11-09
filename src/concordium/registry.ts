@@ -1,4 +1,4 @@
-import { AccountAddress, type ConcordiumGRPCClient } from "@concordium/web-sdk";
+import { AccountAddress, tokenAddressFromBase58, type ConcordiumGRPCClient } from "@concordium/web-sdk";
 import type { AgentRegistry, BadgeVerdict, OwnerKind } from "../core/types.js";
 import type { LiveConfig } from "./config.js";
 
@@ -34,6 +34,9 @@ export class ConcordiumRegistry implements AgentRegistry {
 
   private async resolve(badge: string): Promise<BadgeVerdict> {
     const base: BadgeVerdict = { badge, network: this.cfg.caip2, found: false, active: false, cardHashMatches: false, verified: false, ownerKind: "unknown", issues: [] };
+    // Only the trusted registry instance counts; decided locally, before any network call.
+    const contractIssue = badgeContractIssue(badge, this.cfg.registryContract);
+    if (contractIssue) return { ...base, issues: [contractIssue] };
     const rec = await this.tool("agent_by_token_address", { token_address: badge, network: this.cfg.network });
     if (rec.error || !rec.data || typeof rec.data !== "object") return { ...base, issues: ["not_registered", ...(rec.error ? [rec.error.slice(0, 160)] : [])] };
     const d = rec.data as Record<string, any>;
@@ -97,6 +100,20 @@ export class ConcordiumRegistry implements AgentRegistry {
   private tool(name: string, args: Record<string, unknown>) {
     return registryTool(this.cfg.registryMcpUrl, name, args, ++this.rpcId);
   }
+}
+
+/**
+ * A badge is a CIS-2 token address: Base58Check of (contract index, subindex, token id). Returns an
+ * issue unless it decodes and names exactly the trusted CIS-8004 contract.
+ */
+export function badgeContractIssue(badge: string, trusted: { index: bigint; subindex: bigint }): string | undefined {
+  let t;
+  try {
+    t = tokenAddressFromBase58(badge);
+  } catch {
+    return "badge_malformed";
+  }
+  return BigInt(t.contract.index) === trusted.index && BigInt(t.contract.subindex) === trusted.subindex ? undefined : "untrusted_registry_contract";
 }
 
 /** Calls one tool on the hosted Agent Registry MCP server (stateless JSON-RPC over Streamable HTTP). */

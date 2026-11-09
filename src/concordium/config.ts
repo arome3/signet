@@ -12,6 +12,11 @@ export interface LiveConfig {
   grpcPort: number;
   /** Concordium's hosted Agent Registry MCP server (Streamable HTTP). */
   registryMcpUrl: string;
+  /**
+   * The CIS-8004 Agent Registry instance this deployment trusts. Any contract can implement CIS-8004,
+   * so badges from other instances are refused ("verifiers choose which registries they trust").
+   */
+  registryContract: { index: bigint; subindex: bigint };
   /** PLT used for payments (testnet: request one via the PLT issuance form, or use USDR if you hold it). */
   asset: string;
   /** Identity-provider indices treated as agent / business issuers. Empty = auto-detect by IdP name. */
@@ -28,10 +33,17 @@ export function loadConfig(env = process.env): LiveConfig {
     grpcHost: env.CCD_GRPC_HOST ?? (network === "mainnet" ? "grpc.mainnet.concordium.software" : "grpc.testnet.concordium.com"),
     grpcPort: Number(env.CCD_GRPC_PORT ?? 20000),
     registryMcpUrl: env.AGENT_REGISTRY_MCP_URL ?? "https://agent-registry-mcp.concordium.com/mcp",
+    registryContract: parseContract(env.AGENT_REGISTRY_CONTRACT ?? (network === "mainnet" ? "10082,0" : "12802,0")),
     asset: env.SIGNET_ASSET ?? "USDR",
     agentIdps: list(env.AGENT_IDP_INDICES),
     businessIdps: list(env.BUSINESS_IDP_INDICES),
   };
+}
+
+function parseContract(v: string): { index: bigint; subindex: bigint } {
+  const m = /^\s*(\d+)\s*,\s*(\d+)\s*$/.exec(v);
+  if (!m) throw new Error(`AGENT_REGISTRY_CONTRACT must look like "12802,0", got "${v}"`);
+  return { index: BigInt(m[1]), subindex: BigInt(m[2]) };
 }
 
 export function grpcClient(cfg: LiveConfig): ConcordiumGRPCNodeClient {

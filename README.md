@@ -55,16 +55,20 @@ Mock mode starts a local FreshMart automatically. Ask your assistant to "buy 2 l
 
 ## Run on Concordium testnet
 
-1. Create test identities in the ID App or Browser Wallet (testnet):
-   - a personal identity for the owner and agent;
-   - a **Global FinReg** business identity for the merchant.
-2. Request test CCD for the facilitator account (Activity > Request CCD).
-3. Get a payment stablecoin on testnet. Either use USDR, if you hold some, or request your own via the PLT issuance form. Set `SIGNET_ASSET`.
-4. Register both agents at https://agent-registry.concordium.com (testnet), host each Agent Card and set the URL and hash.
-5. Export the accounts from the Browser Wallet into `keys/`, then fill in `.env` from `.env.example`.
-6. Owner signs the mandate: `npm run mandate:sign`, then publish the printed hash as the agent badge's `signet.mandate` metadata.
-7. Merchant proves its domain with a DNS TXT record `_signet.<domain>` = `signet-account=<merchant account>`, then `npm run directory:build` signs the listing and the directory.
-8. Run `npm run demo:live`. It prints CCDExplorer links for the payments and the log anchors.
+1. In the Concordium Wallet (testnet), create a **Concordium testnet IP** identity with two accounts (owner, agent),
+   and a **Global FinReg** business identity with one account (merchant). Request test CCD for the agent and the
+   merchant before anything else is sent to them (the faucet only serves accounts with no incoming transfers).
+2. Export the three keys to `keys/owner.export`, `keys/agent.export`, `keys/merchant.export`, and fill in `.env`
+   from `.env.example`. Payments can be in native CCD (`SIGNET_ASSET=CCD`) or a 6-decimal PLT.
+3. `npm run testnet -- card agent <url>` (and `merchant`): host each Agent Card at that URL, byte for byte.
+4. `npm run testnet -- register agent` (and `merchant`) mints the CIS-8004 badges. Then `card <role>` again and
+   `pin <role>` to pin the final card, which carries its token address.
+5. `npm run mandate:sign`, then `npm run testnet -- publish-mandate` sets the badge's `signet.mandate`.
+6. Add the DNS TXT record `_signet.<domain>` = `signet-account=<merchant account>`, then `npm run directory:build`.
+7. `npm run testnet -- check` until every line is ok, then `npm run demo:live`. Every CCDExplorer link (payments,
+   anchors) is printed and written to `out/live-links.txt`, and each receipt is verified on chain.
+
+Signet only trusts badges from the official registry instance (testnet `<12802,0>`, mainnet `<10082,0>`).
 
 ## Layout
 

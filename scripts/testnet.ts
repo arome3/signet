@@ -7,6 +7,8 @@
  *   npm run testnet -- card agent <public-url>     build the agent's Agent Card -> out/testnet/agent-card.json (host it at <public-url>)
  *   npm run testnet -- card merchant <public-url>  same for the merchant
  *   npm run testnet -- register agent|merchant     verify the hosted card's hash, then mint the CIS-8004 badge (signed with that role's key)
+ *   npm run testnet -- card agent                  after registering: rebuild the card with its tokenAddress (host it at the same URL)
+ *   npm run testnet -- pin agent|merchant          verify the re-hosted card, then pin its hash on-chain with setAgentURI
  *   npm run testnet -- publish-mandate             set the agent badge's `signet.mandate` metadata to the signed mandate's hash
  */
 import { createHash } from "node:crypto";
@@ -62,7 +64,11 @@ async function sendUpdate(acc: LoadedAccount, built: any): Promise<string> {
   return hex;
 }
 
-async function card(r: Role, uri?: string) {
+async function card(r: Role, uriArg?: string) {
+  const prev = state(r);
+  // Before minting the card has no tokenAddress; after minting, rebuild it with the token id so the badge's
+  // Concordium extension block is complete, and pin the new hash with `pin`.
+  const uri = uriArg ?? prev.agentUri;
   if (!uri || !/^https:\/\//.test(uri)) throw new Error("give the public https URL where you will host the card");
   const acc = loadWalletExport(KEYS[r]);
   const isAgent = r === "agent";
@@ -73,6 +79,7 @@ async function card(r: Role, uri?: string) {
       : "Grocery merchant agent: quotes over x402, checks buyer badges, mandates and age, settles on Concordium.",
     agent_uri: uri,
     owner_account: acc.address,
+    ...(prev.tokenId !== undefined ? { token_id: String(prev.tokenId) } : {}),
     skills: isAgent
       ? [{ id: "shop", name: "Shop within a mandate", description: "Buys from verified merchants within its owner's limits", tags: ["signet", "x402"] }]
       : [{ id: "sell", name: "Sell groceries over x402", description: "Quotes and settles orders for verified agents", tags: ["signet", "x402"] }],
@@ -81,8 +88,30 @@ async function card(r: Role, uri?: string) {
   const sha = createHash("sha256").update(json).digest("hex");
   if (sha !== built.metadata_hash_hex) throw new Error("registry hash does not match the card bytes; not writing");
   writeFileSync(`${OUT}/${r}-card.json`, json);
-  save(r, { ...state(r), account: acc.address, agentUri: uri, metadataHash: sha, cardFile: `${OUT}/${r}-card.json` });
-  console.log(`Wrote ${OUT}/${r}-card.json (sha256 ${sha}).\nHost it byte-for-byte at ${uri}, then run: npm run testnet -- register ${r}`);
+  save(r, { ...prev, account: acc.address, agentUri: uri, metadataHash: sha, cardFile: `${OUT}/${r}-card.json`, pinned: prev.tokenId === undefined ? undefined : false });
+  const next = prev.tokenId === undefined ? `npm run testnet -- register ${r}` : `npm run testnet -- pin ${r}`;
+  console.log(`Wrote ${OUT}/${r}-card.json (sha256 ${sha}${prev.tokenId !== undefined ? `, includes token ${prev.tokenId}` : ""}).\nHost it byte-for-byte at ${uri}, then run: ${next}`);
+}
+
+/** Fetches the hosted card and requires its exact bytes to hash to `expected`. */
+async function hostedCardMatches(uri: string, expected: string, file: string) {
+  const res = await fetch(uri, { signal: AbortSignal.timeout(15000), cache: "no-store" });
+  const got = createHash("sha256").update(Buffer.from(await res.arrayBuffer())).digest("hex");
+  if (res.status !== 200 || got !== expected) throw new Error(`hosted card at ${uri} is HTTP ${res.status}, sha256 ${got}; expected ${expected}. Host ${file} byte-for-byte (caches can take a few minutes).`);
+}
+
+async function pin(r: Role) {
+  const s = state(r);
+  if (s.tokenId === undefined) throw new Error(`register ${r} first`);
+  if (s.pinned !== false) throw new Error(`nothing new to pin; run: npm run testnet -- card ${r}`);
+  await hostedCardMatches(s.agentUri, s.metadataHash, s.cardFile);
+  const acc = loadWalletExport(KEYS[r]);
+  const built = await mcp("build_set_agent_uri", { token_id: String(s.tokenId), agent_uri: s.agentUri, metadata_hash_hex: s.metadataHash, sender: acc.address });
+  const tx = await sendUpdate(acc, built);
+  const v = await mcp("verify_agent_card", { token_id: String(s.tokenId) });
+  save(r, { ...s, pinned: true, pinTx: tx });
+  if (v?.match !== true) throw new Error(`pinned (tx ${tx}) but verify_agent_card reports match=${v?.match}`);
+  console.log(`${r} card pinned and verified (match=true).`);
 }
 
 async function register(r: Role) {
@@ -90,10 +119,7 @@ async function register(r: Role) {
   if (!s.agentUri) throw new Error(`run: npm run testnet -- card ${r} <url> first`);
   if (s.badge) return console.log(`${r} already registered: badge ${s.badge} (${s.registerTx})`);
   const acc = loadWalletExport(KEYS[r]);
-  const res = await fetch(s.agentUri, { signal: AbortSignal.timeout(15000) });
-  const body = Buffer.from(await res.arrayBuffer());
-  const got = createHash("sha256").update(body).digest("hex");
-  if (res.status !== 200 || got !== s.metadataHash) throw new Error(`hosted card at ${s.agentUri} is HTTP ${res.status}, sha256 ${got}; expected ${s.metadataHash}. Host ${s.cardFile} byte-for-byte.`);
+  await hostedCardMatches(s.agentUri, s.metadataHash, s.cardFile);
   console.log(`Card at ${s.agentUri} matches. Registering ${r} from ${acc.address} ...`);
   const built = await mcp("build_register", { agent_uri: s.agentUri, metadata_hash_hex: s.metadataHash, sender: acc.address });
   const tx = await sendUpdate(acc, built);
@@ -161,6 +187,13 @@ async function check() {
     const v = await registry.check(badge);
     const owns = accounts[r] && [v.owner, v.agentWallet].includes(accounts[r]!.address);
     console.log(`${ok(v.verified && !!owns)} ${r} badge ${badge}: verified=${v.verified} ownerKind=${v.ownerKind} key-account-bound=${!!owns}${v.issues.length ? ` issues=${v.issues.join(",")}` : ""}`);
+    // Concordium's own badge verdict: top-level badge_valid, a checks map and an issues list.
+    const cb = await registryTool(cfg.registryMcpUrl, "check_badge", { id: badge, network: cfg.network });
+    const d = (cb.data ?? {}) as Record<string, any>;
+    const failing = Object.entries(d.checks ?? {}).filter(([, v]) => v === false).map(([k]) => k);
+    const issues = (Array.isArray(d.issues) ? d.issues : []).map((i: any) => i?.message ?? String(i)).slice(0, 3);
+    const valid = d.badge_valid === true;
+    console.log(`${ok(valid)} ${r} check_badge: ${cb.error ? cb.error.slice(0, 120) : `badge_valid=${d.badge_valid}${failing.length ? ` failing=${failing.join(",")}` : ""}${issues.length ? ` issues=${issues.join(" | ")}` : ""}`}${valid ? "" : `  (after registering: npm run testnet -- card ${r}, host it, npm run testnet -- pin ${r})`}`);
     if (r === "agent") {
       const file = process.env.SIGNED_MANDATE_FILE ?? "out/mandate.signed.json";
       const want = existsSync(file) ? mandateHash(JSON.parse(readFileSync(file, "utf8")).mandate) : undefined;
@@ -183,8 +216,9 @@ try {
   if (cmd === "check") await check();
   else if (cmd === "card") await card(role(a), b);
   else if (cmd === "register") await register(role(a));
+  else if (cmd === "pin") await pin(role(a));
   else if (cmd === "publish-mandate") await publishMandate();
-  else console.log("usage: npm run testnet -- check | card <agent|merchant> <url> | register <agent|merchant> | publish-mandate");
+  else console.log("usage: npm run testnet -- check | card <agent|merchant> [url] | register <agent|merchant> | pin <agent|merchant> | publish-mandate");
 } catch (e) {
   console.error(`error: ${(e as Error).message}`);
   process.exit(1);
