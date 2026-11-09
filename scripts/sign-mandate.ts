@@ -16,7 +16,8 @@ const need = (n: string) => process.env[n] || (console.error(`missing env ${n} (
 const owner = loadWalletExport(need("OWNER_WALLET_FILE"));
 const draft = JSON.parse(readFileSync(need("MANDATE_FILE"), "utf8"));
 if (!draft.owner || /^YOUR_/.test(draft.owner)) draft.owner = owner.address;
-const mandate = parseMandate({ ...draft, agent: need("AGENT_BADGE") });
+// The mandate's asset must be the asset payments are made in (e.g. CCD for a first run without a stablecoin).
+const mandate = parseMandate({ ...draft, asset: process.env.SIGNET_ASSET || draft.asset, agent: need("AGENT_BADGE") });
 if (mandate.owner !== owner.address) {
   console.error(`mandate names owner ${mandate.owner} but OWNER_WALLET_FILE is ${owner.address}`);
   process.exit(1);

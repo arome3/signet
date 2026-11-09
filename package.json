@@ -11,6 +11,7 @@
     "mcp": "tsx src/mcp/server.ts",
     "mandate:sign": "tsx scripts/sign-mandate.ts",
     "directory:build": "tsx scripts/build-directory.ts",
+    "testnet": "tsx scripts/testnet.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
