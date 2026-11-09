@@ -6,6 +6,7 @@ import { challengeMessage, newChallenge } from "../src/core/challenge.js";
 import { encodeAnchor } from "../src/core/anchor.js";
 import { sha256Hex } from "../src/core/canonical.js";
 import { serializeAccountSignature } from "../src/concordium/account.js";
+import { agentTokenIdParam, parseWalletNonce, setAgentWalletMessage } from "../src/concordium/agent-wallet.js";
 
 /** Real Concordium SDK code paths that do not need a node: message signing and tx construction. */
 function keypair() {
@@ -61,5 +62,41 @@ describe("AccountSignatures wire form (for CIS-8004 setAgentWallet)", () => {
     const [a, b, c] = ["aa", "bb", "cc"].map((x) => x.repeat(64));
     expect(serializeAccountSignature({ 1: { 0: c }, 0: { 2: b, 0: a } })).toBe("02" + "00" + "02" + "0000" + a + "0200" + b + "01" + "01" + "0000" + c);
     expect(() => serializeAccountSignature({ 0: { 0: "abcd" } })).toThrow(/64-byte/);
+  });
+});
+
+describe("CIS-8004 setAgentWallet message (deployed contract layout)", () => {
+  const fields = {
+    tokenId: 1060n,
+    owner: Buffer.alloc(32, 0x11),
+    newWallet: Buffer.alloc(32, 0x22),
+    nonce: 0n,
+    deadlineMs: 1_800_000_000_000n,
+    contract: { index: 12802n, subindex: 0n },
+    genesisHash: Buffer.alloc(32, 0x33),
+  };
+
+  it("is 162 bytes: tag, token, owner, wallet, nonce, deadline, contract, genesis", () => {
+    const m = setAgentWalletMessage(fields);
+    expect(m.length).toBe(162);
+    expect(m.subarray(0, 26).toString("ascii")).toBe("CIS-8004/v1/setAgentWallet");
+    expect(m.readBigUInt64LE(26)).toBe(1060n);
+    expect(m.subarray(34, 66).equals(fields.owner)).toBe(true);
+    expect(m.subarray(66, 98).equals(fields.newWallet)).toBe(true);
+    expect(m.readBigUInt64LE(98)).toBe(0n);
+    expect(m.readBigUInt64LE(106)).toBe(1_800_000_000_000n);
+    expect(m.readBigUInt64LE(114)).toBe(12802n);
+    expect(m.readBigUInt64LE(122)).toBe(0n);
+    expect(m.subarray(130).equals(fields.genesisHash)).toBe(true);
+    expect(() => setAgentWalletMessage({ ...fields, owner: Buffer.alloc(31) })).toThrow(/32 bytes/);
+  });
+
+  it("reads the nonce raw (as the standard says) or Option-tagged (as testnet returns), nothing else", () => {
+    const raw = Buffer.alloc(8);
+    raw.writeBigUInt64LE(5n);
+    expect(parseWalletNonce(raw)).toBe(5n);
+    expect(parseWalletNonce(Buffer.from("010000000000000000", "hex"))).toBe(0n);
+    expect(() => parseWalletNonce(Buffer.from("000000000000000000", "hex"))).toThrow(/unexpected/);
+    expect(agentTokenIdParam(1060n).toString("hex")).toBe("082404000000000000");
   });
 });

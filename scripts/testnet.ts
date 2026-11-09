@@ -19,9 +19,10 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { AccountAddress, CcdAmount, ContractAddress, Energy, Parameter, ReceiveName, signMessage, TransactionExpiry, TransactionHash } from "@concordium/web-sdk";
+import { AccountAddress, BlockHash, CcdAmount, ContractAddress, Energy, Parameter, ReceiveName, ReturnValue, TransactionExpiry, TransactionHash } from "@concordium/web-sdk";
 import { Transaction } from "@concordium/web-sdk/transactions";
 import { serializeAccountSignature } from "../src/concordium/account.js";
+import { agentTokenIdParam, parseWalletNonce, setAgentWalletMessage } from "../src/concordium/agent-wallet.js";
 import { explorerTx, grpcClient, loadConfig, loadWalletExport, type LoadedAccount } from "../src/concordium/config.js";
 import { DnsDomainVerifier } from "../src/concordium/domain.js";
 import { ConcordiumRegistry, registryTool } from "../src/concordium/registry.js";
@@ -105,6 +106,8 @@ async function card(r: Role, uriArg?: string) {
       : "Grocery merchant agent: quotes over x402, checks buyer badges, mandates and age, settles on Concordium.",
     agent_uri: uri,
     owner_account: acc.address,
+    // The agent pays from its own account, set on-chain by `wallet agent`; the card must say the same.
+    ...(isAgent ? { agent_wallet: loadWalletExport(KEYS.agent).address } : {}),
     ...(prev.tokenId !== undefined ? { token_id: String(prev.tokenId) } : {}),
     skills: isAgent
       ? [{ id: "shop", name: "Shop within a mandate", description: "Buys from verified merchants within its owner's limits", tags: ["signet", "x402"] }]
@@ -166,9 +169,9 @@ const walletOf = (d: any): string | undefined => (typeof d === "string" ? d : (d
 
 /**
  * Sets the agent's account as the badge's agentWallet. CIS-8004 needs two authorisations: the agent's account
- * signs the contract's canonical message (proving it agrees to be the wallet) and the owner sends the
- * transaction. The deployed contract's message layout comes from the registry server; the signature encoding
- * is chosen by dry-running each candidate, and only one the contract accepts is sent.
+ * signs the 162-byte setAgentWallet message (proving it agrees to be the wallet) and the owner sends the
+ * transaction. See src/concordium/agent-wallet.ts for the layout the deployed contract checks. Dry-run first;
+ * nothing is sent unless the contract would accept it.
  */
 async function setWallet() {
   const s = state("agent");
@@ -180,34 +183,34 @@ async function setWallet() {
     save("agent", { ...s, agentWallet: agent.address });
     return console.log(`agentWallet is already ${agent.address}`);
   }
-  const deadline_unix_ms = Date.now() + 10 * 60_000;
-  const cb = await mcp("set_agent_wallet_canonical_bytes", { token_id, new_wallet: agent.address, deadline_unix_ms });
-  const bytes = Buffer.from(String(cb.bytes_hex ?? ""), "hex");
-  if (!bytes.length || bytes.length !== cb.byte_length) throw new Error(`canonical message is ${bytes.length} bytes, server says ${cb.byte_length}`);
-  if (!bytes.subarray(0, 26).equals(Buffer.from("CIS-8004/v1/setAgentWallet"))) throw new Error("canonical message does not start with the CIS-8004 setAgentWallet tag; not signing it");
-  const viaWallet = await signMessage(agent.accountAddress, bytes, agent.signer);
-  const raw = await agent.signer.sign(new Uint8Array(bytes).buffer);
-  const candidates: [string, string][] = [
-    ["account message signature (as the wallet's signMessage)", viaWallet[0][0]],
-    ["account message signature, serialized AccountSignatures", serializeAccountSignature(viaWallet)],
-    ["ed25519 over the bytes", raw[0][0]],
-    ["ed25519 over the bytes, serialized AccountSignatures", serializeAccountSignature(raw)],
-  ];
-  for (const [label, signature_hex] of candidates) {
-    const built = await mcp("build_set_agent_wallet", { token_id, new_wallet: agent.address, deadline_unix_ms, signature_hex, sender: owner.address });
-    const d = await dryRun(owner.address, built);
-    if (!d.ok) {
-      console.log(`  dry run rejected (${label}): ${d.reason}`);
-      continue;
-    }
-    console.log(`  dry run accepted: ${label}`);
-    const tx = await sendUpdate(owner, built);
-    const now = walletOf(await mcp("get_agent_wallet", { token_id }));
-    save("agent", { ...s, agentWallet: agent.address, walletTx: tx, walletSignature: label });
-    if (now !== agent.address) throw new Error(`setAgentWallet sent (tx ${tx}) but the registry reads back ${now ?? "nothing"}`);
-    return console.log(`agentWallet = ${agent.address} on ${s.badge}, read back OK.`);
-  }
-  throw new Error("the contract rejected every signature encoding in a dry run; nothing was sent");
+  const contract = cfg.registryContract;
+  const nr = await grpc.invokeContract({
+    contract: ContractAddress.create(contract.index, contract.subindex),
+    method: ReceiveName.fromString("CIS-8004.getAgentWalletNonce"),
+    parameter: Parameter.fromHexString(agentTokenIdParam(BigInt(token_id)).toString("hex")),
+    energy: Energy.create(50_000n),
+  });
+  if (nr.tag !== "success" || !nr.returnValue) throw new Error(`getAgentWalletNonce failed: ${json(nr.tag === "failure" ? nr.reason : "no value").slice(0, 200)}`);
+  const nonce = parseWalletNonce(ReturnValue.toBuffer(nr.returnValue));
+  const genesisHash = BlockHash.toBuffer((await grpc.getConsensusStatus()).genesisBlock);
+  const deadlineMs = BigInt(Date.now() + 5 * 60_000);
+  const message = setAgentWalletMessage({
+    tokenId: BigInt(token_id),
+    owner: AccountAddress.toBuffer(owner.accountAddress),
+    newWallet: AccountAddress.toBuffer(agent.accountAddress),
+    nonce,
+    deadlineMs,
+    contract,
+    genesisHash,
+  });
+  // Plain Ed25519 over the message (the contract's check_account_signature), as serialized AccountSignatures.
+  const signature_hex = serializeAccountSignature(await agent.signer.sign(new Uint8Array(message).buffer));
+  const built = await mcp("build_set_agent_wallet", { token_id, new_wallet: agent.address, deadline_unix_ms: Number(deadlineMs), signature_hex, sender: owner.address });
+  const tx = await sendUpdate(owner, built);
+  const now = walletOf(await mcp("get_agent_wallet", { token_id }));
+  save("agent", { ...s, agentWallet: agent.address, walletTx: tx });
+  if (now !== agent.address) throw new Error(`setAgentWallet sent (tx ${tx}) but the registry reads back ${now ?? "nothing"}`);
+  console.log(`agentWallet = ${agent.address} on ${s.badge}, read back OK.`);
 }
 
 async function publishMandate() {
@@ -269,10 +272,14 @@ async function check() {
       console.log(`${ok(!!accounts.agent && v.agentWallet === accounts.agent.address)} agentWallet is the agent account (${v.agentWallet ?? "not set: npm run testnet -- wallet agent"})`);
       const tokenId = state("agent").tokenId;
       if (tokenId !== undefined && accounts.agent && ctrl) {
-        // Free dry run of the attack this design prevents: the agent rewriting its own mandate.
-        const probe = await mcp("build_set_metadata", { token_id: String(tokenId), key: "signet.mandate", value_hex: "00", sender: accounts.agent.address });
+        // Free dry run of the attack this design prevents: the agent rewriting its own mandate. Uses a valid
+        // value (a 64-hex hash, as published) so the only difference between the two runs is the sender, and
+        // requires the agent's rejection to be CIS-8004 Unauthorized (-7201), not some other error.
+        const value_hex = Buffer.from(v.mandateHash ?? "0".repeat(64), "utf8").toString("hex");
+        const probe = await mcp("build_set_metadata", { token_id: String(tokenId), key: "signet.mandate", value_hex, sender: accounts.agent.address });
         const [asAgent, asOwner] = [await dryRun(accounts.agent.address, probe), await dryRun(ctrl.address, probe)];
-        console.log(`${ok(!asAgent.ok && asOwner.ok)} only the owner can change signet.mandate (dry run: agent ${asAgent.ok ? "ACCEPTED" : "rejected"}, owner ${asOwner.ok ? "accepted" : `rejected: ${asOwner.reason}`})`);
+        const unauthorized = !asAgent.ok && /"rejectReason":-7201\b/.test(asAgent.reason ?? "");
+        console.log(`${ok(unauthorized && asOwner.ok)} only the owner can change signet.mandate (dry run: agent ${asAgent.ok ? "ACCEPTED" : unauthorized ? "rejected as Unauthorized" : `rejected for another reason: ${asAgent.reason}`}, owner ${asOwner.ok ? "accepted" : `rejected: ${asOwner.reason}`})`);
       }
     }
     // Concordium's own badge verdict: top-level badge_valid, a checks map and an issues list.
