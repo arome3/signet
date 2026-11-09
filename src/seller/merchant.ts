@@ -44,9 +44,18 @@ export interface SellerConfig {
   makeAgeRequest?: (threshold: number, orderHash: string) => Promise<unknown>;
 }
 
+/**
+ * Each order is single-use: quoted -> in_flight (set synchronously on the first pay attempt, before
+ * any await) -> paid | rejected. Any further attempt is refused, so concurrent or replayed pay
+ * requests cannot settle twice, and a rejected attempt cannot be retried with patched evidence.
+ */
+type OrderState = "quoted" | "in_flight" | "paid" | "rejected";
+
 interface Pending {
+  state: OrderState;
   order: Order;
   orderHash: string;
+  session: string;
   challenge: Challenge;
   requirements: PaymentRequirements;
   buyerBadge: string;
@@ -63,6 +72,8 @@ interface Pending {
 export function createMerchantApp(cfg: SellerConfig) {
   const policy: SellerPolicy = { requireAgentAccount: false, allowHumanBackedAgents: true, ...cfg.policy };
   const pending = new Map<string, Pending>();
+  /** Hashes of every payment payload ever presented: a signed payment is good for one attempt only. */
+  const seenPayments = new Set<string>();
   const app = express();
   app.use(express.json());
 
@@ -75,7 +86,19 @@ export function createMerchantApp(cfg: SellerConfig) {
     res.json({ merchant: cfg.name, badge: cfg.badge, asset: cfg.asset, network: cfg.rail.network, catalog: cfg.catalog.map((c) => ({ ...c, unitPrice: c.unitPrice.toString() })) });
   });
 
-  app.post("/orders", async (req: Request, res: Response) => {
+  /** Async handlers that throw become logged refusals (fail closed), never hung requests. */
+  const guarded = (h: (req: Request, res: Response) => Promise<unknown>) => async (req: Request, res: Response) => {
+    try {
+      await h(req, res);
+    } catch {
+      const p = pending.get(String(req.params.id ?? ""));
+      if (p?.state === "in_flight") p.state = "rejected";
+      if (!res.headersSent) reject(res, 500, ["internal_error"], p?.order.id);
+      else cfg.ledger.append({ type: "payment_rejected", actor: cfg.badge, orderId: p?.order.id, data: { reasons: ["internal_error_after_response"], by: cfg.badge } });
+    }
+  };
+
+  app.post("/orders", guarded(async (req: Request, res: Response) => {
     const buyerBadge = req.header(H.agent);
     const buyerNonce = req.header(H.nonce);
     if (!buyerBadge || !buyerNonce) return reject(res, 401, ["missing_agent_badge_or_nonce"]);
@@ -112,16 +135,18 @@ export function createMerchantApp(cfg: SellerConfig) {
       createdAt: new Date().toISOString(),
     };
     const orderHash = hashOf(order);
-    const challenge = newChallenge(cfg.badge, orderHash);
-    const merchantProof: BadgeProof = await proveBadge(cfg.badge, cfg.prover, { ...newChallenge(buyerBadge, orderHash), nonce: buyerNonce });
+    const session = "ses_" + randomHex(16);
+    const challenge = newChallenge(cfg.badge, orderHash, { session });
+    const merchantProof: BadgeProof = await proveBadge(cfg.badge, cfg.prover, newChallenge(buyerBadge, orderHash, { session, nonce: buyerNonce, ttlSeconds: 300 }));
     const requirements = await cfg.rail.requirements({ payTo: cfg.payTo, asset: cfg.asset, amount: total });
     const ageRequest = ageOver && cfg.makeAgeRequest ? await cfg.makeAgeRequest(ageOver, orderHash) : undefined;
-    pending.set(order.id, { order, orderHash, challenge, requirements, buyerBadge, ageOver, ageRequest });
+    pending.set(order.id, { state: "quoted", order, orderHash, session, challenge, requirements, buyerBadge, ageOver, ageRequest });
 
     const offer: SignetOffer = {
       merchant: { badge: cfg.badge, name: cfg.name, domain: cfg.domain },
       order,
       orderHash,
+      session,
       merchantProof,
       challenge,
       requires: { ageOver, ageRequest, agentAccount: policy.requireAgentAccount },
@@ -132,34 +157,44 @@ export function createMerchantApp(cfg: SellerConfig) {
       accepts: [requirements],
       extensions: { signet: offer },
     };
-    cfg.ledger.append({ type: "request", actor: cfg.badge, orderId: order.id, data: { buyer: buyerBadge, total: order.total, asset: order.asset, categories: order.categories, ageOver }, privateRecord: order });
+    cfg.ledger.append({ type: "request", actor: cfg.badge, orderId: order.id, data: { buyer: buyerBadge, session, total: order.total, asset: order.asset, categories: order.categories, ageOver }, privateRecord: order });
     res.status(402).setHeader(H.paymentRequired, encodePaymentRequiredHeader(pr)).json({ error: "payment_required", orderId: order.id });
-  });
+  }));
 
-  app.post("/orders/:id/pay", async (req: Request, res: Response) => {
+  app.post("/orders/:id/pay", guarded(async (req: Request, res: Response) => {
     const p = pending.get(req.params.id);
     if (!p) return reject(res, 404, ["unknown_order"]);
-    if (p.paid) return res.status(200).json(p.paid);
     const orderId = p.order.id;
+    if (p.state !== "quoted") return reject(res, 409, [p.state === "paid" ? "order_already_paid" : "order_already_used"], orderId);
+    // Claim the order before the first await: a concurrent request now sees in_flight.
+    p.state = "in_flight";
+    const refuse = (status: number, reasons: string[], actor?: string) => {
+      p.state = "rejected";
+      return reject(res, status, reasons, orderId, actor);
+    };
+    if (!(p.challenge.exp >= Math.floor(Date.now() / 1000))) return refuse(410, ["order_expired"]);
 
     const proof = decodeHeader<BadgeProof>(req.header(H.proof));
     const attest = decodeHeader<AttributeProof[]>(req.header(H.attest)) ?? [];
     const consent = decodeHeader<ConsentResult>(req.header(H.consent));
     const sigHeader = req.header(H.paymentSignature);
-    if (!proof || !sigHeader) return reject(res, 400, ["missing_proof_or_payment"], orderId);
+    if (!proof || !sigHeader) return refuse(400, ["missing_proof_or_payment"]);
     let payment: PaymentPayload;
     try {
       payment = decodePaymentSignatureHeader(sigHeader);
     } catch {
-      return reject(res, 400, ["bad_payment_header"], orderId);
+      return refuse(400, ["bad_payment_header"]);
     }
+    const paymentId = hashOf(payment.payload);
+    if (seenPayments.has(paymentId)) return refuse(409, ["payment_replayed"], proof.badge);
+    seenPayments.add(paymentId);
 
     // Who is paying, and can they prove it?
     const verdict = await cfg.registry.check(proof.badge);
     const issues: string[] = [];
     if (proof.badge !== p.buyerBadge) issues.push("badge_changed_since_quote");
     if (!verdict.verified) issues.push("buyer_not_verified", ...verdict.issues);
-    issues.push(...(await checkBadgeProof(proof, { audience: cfg.badge, orderHash: p.orderHash, nonce: p.challenge.nonce }, [verdict.owner, verdict.agentWallet], cfg.verifier)));
+    issues.push(...(await checkBadgeProof(proof, { audience: cfg.badge, orderHash: p.orderHash, nonce: p.challenge.nonce, session: p.session }, [verdict.owner, verdict.agentWallet], cfg.verifier)));
 
     // The owner's mandate, checked here as well: a compromised buyer runtime that skips its own
     // mandate check still cannot get paid outside the owner's limits.
@@ -215,7 +250,7 @@ export function createMerchantApp(cfg: SellerConfig) {
     if (!v.isValid) issues.push(`payment_invalid:${v.invalidReason}`);
     else if (v.payer !== proof.account) issues.push("payer_not_badge_account");
 
-    if (issues.length) return reject(res, 403, issues, orderId, proof.badge);
+    if (issues.length) return refuse(403, issues, proof.badge);
     cfg.ledger.append({
       type: "payment_verified",
       actor: cfg.badge,
@@ -233,7 +268,7 @@ export function createMerchantApp(cfg: SellerConfig) {
     });
 
     const s = await cfg.rail.settle(payment, p.requirements);
-    if (!s.success) return reject(res, 402, [`settlement_failed:${s.errorReason}`], orderId, proof.badge);
+    if (!s.success) return refuse(402, [`settlement_failed:${s.errorReason}`], proof.badge);
     const receipt: Receipt = {
       orderId,
       orderHash: p.orderHash,
@@ -244,11 +279,12 @@ export function createMerchantApp(cfg: SellerConfig) {
       buyer: proof.badge,
       merchant: cfg.badge,
     };
+    p.state = "paid";
     p.paid = receipt;
     cfg.ledger.append({ type: "payment_settled", actor: cfg.badge, orderId, data: { amount: receipt.paid, asset: receipt.asset, txHash: s.transaction, buyer: proof.badge, direction: "in" } });
     cfg.ledger.append({ type: "delivery", actor: cfg.badge, orderId, data: { receiptHash: hashOf(receipt) }, privateRecord: receipt });
     res.status(200).setHeader(H.paymentResponse, encodePaymentResponseHeader(s)).json(receipt);
-  });
+  }));
 
   return app;
 }

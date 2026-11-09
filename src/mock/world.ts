@@ -46,7 +46,11 @@ export class MockWorld {
   accounts = new Map<string, Account>();
   agents = new Map<string, AgentRecord>();
   dataRegistrations: { txHash: string; sender: string; data: string; ts: string }[] = [];
+  /** Settled transfers by tx hash (stands in for the chain; a tx can only be included once). */
+  transfers = new Map<string, { from: string; to: string; asset: string; amount: string; sponsor: string }>();
   facilitator: string;
+  /** Simulated time to finality for settlements (tests use it to force overlapping requests). */
+  settleLatencyMs = 0;
 
   constructor() {
     this.facilitator = this.createAccount("human").address;
@@ -214,12 +218,16 @@ export class MockWorld {
         return { isValid: true, payer: tx.sender };
       },
       async settle(p, req): Promise<SettleResponse> {
+        if (world.settleLatencyMs) await new Promise((r) => setTimeout(r, world.settleLatencyMs));
         const v = await this.verify(p, req);
         const tx = p.payload.signedTransaction as Record<string, any>;
         if (!v.isValid) return { success: false, errorReason: v.invalidReason, transaction: "", network: MOCK_NETWORK, payer: v.payer };
+        const txHash = hashOf({ tx, sig: p.payload.signature });
+        if (world.transfers.has(txHash)) return { success: false, errorReason: "duplicate_transaction", transaction: "", network: MOCK_NETWORK, payer: v.payer };
+        world.transfers.set(txHash, { from: tx.sender, to: tx.to, asset: tx.asset, amount: tx.amount, sponsor: tx.sponsor });
         world.mustAccount(tx.sender).balances.set(tx.asset, world.balance(tx.sender, tx.asset) - BigInt(tx.amount));
         world.mint(tx.to, tx.asset, BigInt(tx.amount));
-        return { success: true, transaction: hashOf(tx), network: MOCK_NETWORK, payer: tx.sender, amount: tx.amount };
+        return { success: true, transaction: txHash, network: MOCK_NETWORK, payer: tx.sender, amount: tx.amount };
       },
       explorerTx: (h) => `mock://tx/${h}`,
     };

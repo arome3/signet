@@ -91,10 +91,17 @@ export class SignetBuyer {
     if (hashOf(offer.order) !== offer.orderHash) merchantIssues.push("order_hash_mismatch");
     if (req.amount !== offer.order.total || req.asset !== offer.order.asset) merchantIssues.push("payment_terms_mismatch");
     if (offer.merchantProof.badge !== offer.merchant.badge) merchantIssues.push("merchant_proof_badge_mismatch");
+    // The challenge we are asked to sign must be for this merchant, this session and this order;
+    // otherwise we could be made to produce a proof that works somewhere else.
+    const c = offer.challenge;
+    if (c?.audience !== offer.merchant.badge) merchantIssues.push("challenge_audience_not_merchant");
+    if (c?.session !== offer.session) merchantIssues.push("challenge_session_mismatch");
+    if (c?.orderHash !== offer.orderHash) merchantIssues.push("challenge_order_mismatch");
+    if (!(c?.exp >= Math.floor(Date.now() / 1000))) merchantIssues.push("challenge_expired");
     merchantIssues.push(
       ...(await checkBadgeProof(
         offer.merchantProof,
-        { audience: badge, orderHash: offer.orderHash, nonce },
+        { audience: badge, orderHash: offer.orderHash, nonce, session: offer.session },
         [merchant.owner, merchant.agentWallet],
         this.cfg.verifier,
       )),

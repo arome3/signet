@@ -62,6 +62,8 @@ export interface SignetOffer {
   merchant: { badge: string; name: string; domain?: string };
   order: Order;
   orderHash: string;
+  /** Session id for this exchange; the merchant proof and the buyer challenge both carry it. */
+  session: string;
   /** Merchant proves it controls its badge, signed over the buyer's nonce. */
   merchantProof: BadgeProof;
   /** The buyer must sign this. */

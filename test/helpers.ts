@@ -1,6 +1,6 @@
 import { decodePaymentRequiredHeader, encodePaymentSignatureHeader } from "@x402/core/http";
 import type { PaymentRequirements } from "@x402/core/types";
-import { encodeHeader, proveBadge } from "../src/core/challenge.js";
+import { type Challenge, encodeHeader, proveBadge } from "../src/core/challenge.js";
 import { type SignedMandate, type SignedSpend, signSpend, utcDay } from "../src/core/mandate.js";
 import { H, type MandateHeader, type SignetOffer } from "../src/core/protocol.js";
 import type { ConsentResult } from "../src/core/types.js";
@@ -32,13 +32,17 @@ export interface CraftOpts {
   spend?: SignedSpend;
   consent?: ConsentResult;
   attest?: unknown[];
+  /** Sign this challenge instead of the one in the offer. */
+  challenge?: Challenge;
+  /** Reuse an existing signed payment instead of creating one. */
+  payment?: Awaited<ReturnType<ReturnType<Scenario["world"]["rail"]>["createPayment"]>>;
 }
 
 export async function craftPay(s: Scenario, q: { offer: SignetOffer; req: PaymentRequirements }, o: CraftOpts = {}) {
   const account = o.account ?? s.kitAccount.address;
   const badge = o.badge ?? s.kitBadge;
-  const proof = await proveBadge(badge, s.world.prover(account), q.offer.challenge);
-  const payment = await s.world.rail(o.payer ?? account).createPayment(q.req);
+  const proof = await proveBadge(badge, s.world.prover(account), o.challenge ?? q.offer.challenge);
+  const payment = o.payment ?? (await s.world.rail(o.payer ?? account).createPayment(q.req));
   const headers: Record<string, string> = {
     [H.paymentSignature]: encodePaymentSignatureHeader(payment),
     [H.proof]: encodeHeader(proof),
