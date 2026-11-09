@@ -35,9 +35,9 @@ export function adaMandate(agent: string, owner: string): Mandate {
   });
 }
 
-async function listen(app: ReturnType<typeof createMerchantApp>): Promise<{ url: string; server: Server }> {
+async function listen(app: ReturnType<typeof createMerchantApp>, port = 0): Promise<{ url: string; server: Server }> {
   return new Promise((resolve) => {
-    const server = app.listen(0, "127.0.0.1", () => {
+    const server = app.listen(port, "127.0.0.1", () => {
       const { port } = server.address() as AddressInfo;
       resolve({ url: `http://127.0.0.1:${port}`, server });
     });
@@ -58,6 +58,8 @@ export async function buildMockScenario(
     /** What FreshMart actually charges; its directory listing always shows CATALOG. */
     shopCatalog?: CatalogItem[];
     approvalTimeoutMs?: number;
+    /** Persist FreshMart's order state here (enables restartShop to keep it). */
+    shopStateFile?: string;
   } = {},
 ) {
   const world = new MockWorld();
@@ -80,20 +82,22 @@ export async function buildMockScenario(
   world.mint(teen.address, "USDR", USDR(50));
 
   const merchantLedger = new AuditLedger();
-  const merchantApp = createMerchantApp({
-    name: "FreshMart",
-    domain: "freshmart.example",
-    badge: shopBadge,
-    payTo: shop.address,
-    asset: "USDR",
-    catalog: opts.shopCatalog ?? CATALOG,
-    prover: world.prover(shop.address),
-    rail: world.rail(),
-    registry: world.registry(),
-    verifier: world.verifier(),
-    attributes: world.attributeVerifier(),
-    ledger: merchantLedger,
-  });
+  const makeShop = () =>
+    createMerchantApp({
+      name: "FreshMart",
+      domain: "freshmart.example",
+      badge: shopBadge,
+      payTo: shop.address,
+      asset: "USDR",
+      catalog: opts.shopCatalog ?? CATALOG,
+      prover: world.prover(shop.address),
+      rail: world.rail(),
+      registry: world.registry(),
+      verifier: world.verifier(),
+      attributes: world.attributeVerifier(),
+      ledger: merchantLedger,
+      stateFile: opts.shopStateFile,
+    });
   const fakeApp = createMerchantApp({
     name: "FreshMart",
     domain: "freshmart.example",
@@ -108,7 +112,7 @@ export async function buildMockScenario(
     attributes: world.attributeVerifier(),
     ledger: new AuditLedger(),
   });
-  const shopSrv = await listen(merchantApp);
+  let shopSrv = await listen(makeShop());
   const fakeSrv = await listen(fakeApp);
 
   // Directory: FreshMart proves freshmart.example in DNS and lists its catalog. The impostor also
@@ -164,11 +168,24 @@ export async function buildMockScenario(
   });
 
   const close = () => {
+    shopSrv.server.closeAllConnections();
     shopSrv.server.close();
     fakeSrv.server.close();
   };
 
-  return { world, ada, kitAccount, kitBadge, kit, kitLedger, signedMandate, directory, directoryCfg, refusedListings, operator, fake, fakeBadge, shop, shopBadge, shopUrl: shopSrv.url, fakeUrl: fakeSrv.url, merchantLedger, teenAgent, teenBadge, close };
+  /** Stops FreshMart and starts a fresh process-equivalent on the same port (state only from shopStateFile). */
+  const restartShop = async () => {
+    const port = Number(new URL(shopSrv.url).port);
+    shopSrv.server.closeAllConnections();
+    await new Promise<void>((r) => shopSrv.server.close(() => r()));
+    // Let clients' pooled keep-alive sockets see the close before the new server takes the port; a real
+    // client may otherwise get one "fetch failed" on a stale connection (buyers treat that on /pay as an
+    // unknown outcome and keep the spend hold).
+    await new Promise((r) => setTimeout(r, 50));
+    shopSrv = await listen(makeShop(), port);
+  };
+
+  return { world, ada, kitAccount, kitBadge, kit, kitLedger, signedMandate, directory, directoryCfg, refusedListings, operator, fake, fakeBadge, shop, shopBadge, shopUrl: shopSrv.url, fakeUrl: fakeSrv.url, merchantLedger, teenAgent, teenBadge, close, restartShop };
 }
 
 export type Scenario = Awaited<ReturnType<typeof buildMockScenario>>;

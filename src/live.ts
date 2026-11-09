@@ -86,6 +86,7 @@ export function liveMerchant(catalog: CatalogItem[], opts: { ledgerFile?: string
     registry: new ConcordiumRegistry(cfg, grpc),
     verifier: new ConcordiumAccountVerifier(grpc),
     attributes: new ConcordiumAttributeVerifier(cfg, grpc, merchant),
+    stateFile: process.env.MERCHANT_STATE_FILE ?? "out/merchant-state.json",
     makeAgeRequest: (threshold) => createAgeRequest(cfg, grpc, merchant, threshold, process.env.MERCHANT_DOMAIN ?? "freshmart.example", issuers),
     ledger,
   });

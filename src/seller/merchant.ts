@@ -9,6 +9,7 @@ import type { AuditLedger } from "../core/ledger.js";
 import { checkSignedMandate, checkSpend, evaluateMandate, type MandateEvaluation } from "../core/mandate.js";
 import { H, type MandateHeader, type Order, type OrderLine, type Receipt, type SignetOffer } from "../core/protocol.js";
 import { buildReceiptProof, signReceipt } from "../core/receipt.js";
+import { MerchantStore } from "./store.js";
 import type { AccountProver, AccountVerifier, AgentRegistry, AttributeProof, AttributeVerifier, ConsentResult, PaymentRail } from "../core/types.js";
 
 export interface CatalogItem {
@@ -56,28 +57,13 @@ export interface SellerConfig {
   attributes: AttributeVerifier;
   ledger: AuditLedger;
   policy?: Partial<SellerPolicy>;
+  /**
+   * JSON file for order state, used payment signatures and spend received per agent (e.g.
+   * out/merchant-state.json). Without it, state is in memory and a restart forgets paid orders.
+   */
+  stateFile?: string;
   /** Live mode: create and anchor a Verify & Access request for "owner is at least N". */
   makeAgeRequest?: (threshold: number, orderHash: string) => Promise<unknown>;
-}
-
-/**
- * Each order is single-use: quoted -> in_flight (set synchronously on the first pay attempt, before
- * any await) -> paid | rejected. Any further attempt is refused, so concurrent or replayed pay
- * requests cannot settle twice, and a rejected attempt cannot be retried with patched evidence.
- */
-type OrderState = "quoted" | "in_flight" | "paid" | "rejected";
-
-interface Pending {
-  state: OrderState;
-  order: Order;
-  orderHash: string;
-  session: string;
-  challenge: Challenge;
-  requirements: PaymentRequirements;
-  buyerBadge: string;
-  ageOver?: number;
-  ageRequest?: unknown;
-  paid?: Receipt;
 }
 
 /**
@@ -87,9 +73,9 @@ interface Pending {
  */
 export function createMerchantApp(cfg: SellerConfig) {
   const policy: SellerPolicy = { requireAgentAccount: false, allowHumanBackedAgents: true, ...cfg.policy };
-  const pending = new Map<string, Pending>();
-  /** Hashes of every payment payload ever presented: a signed payment is good for one attempt only. */
-  const seenPayments = new Set<string>();
+  /** Orders, used payment signatures and spend received per agent; persisted when cfg.stateFile is set. */
+  const store = new MerchantStore(cfg.stateFile);
+  const pending = store.orders;
   const app = express();
   app.use(express.json());
 
@@ -108,7 +94,10 @@ export function createMerchantApp(cfg: SellerConfig) {
       await h(req, res);
     } catch {
       const p = pending.get(String(req.params.id ?? ""));
-      if (p?.state === "in_flight") p.state = "rejected";
+      if (p?.state === "in_flight") {
+        p.state = "rejected";
+        store.save();
+      }
       if (!res.headersSent) reject(res, 500, ["internal_error"], p?.order.id);
       else cfg.ledger.append({ type: "payment_rejected", actor: cfg.badge, orderId: p?.order.id, data: { reasons: ["internal_error_after_response"], by: cfg.badge } });
     }
@@ -157,6 +146,7 @@ export function createMerchantApp(cfg: SellerConfig) {
     const requirements = await cfg.rail.requirements({ payTo: cfg.payTo, asset: cfg.asset, amount: total });
     const ageRequest = ageOver && cfg.makeAgeRequest ? await cfg.makeAgeRequest(ageOver, orderHash) : undefined;
     pending.set(order.id, { state: "quoted", order, orderHash, session, challenge, requirements, buyerBadge, ageOver, ageRequest });
+    store.save();
 
     const offer: SignetOffer = {
       merchant: { badge: cfg.badge, name: cfg.name, domain: cfg.domain },
@@ -182,10 +172,12 @@ export function createMerchantApp(cfg: SellerConfig) {
     if (!p) return reject(res, 404, ["unknown_order"]);
     const orderId = p.order.id;
     if (p.state !== "quoted") return reject(res, 409, [p.state === "paid" ? "order_already_paid" : "order_already_used"], orderId);
-    // Claim the order before the first await: a concurrent request now sees in_flight.
+    // Claim the order before the first await (and on disk): a concurrent or post-restart request sees in_flight.
     p.state = "in_flight";
+    store.save();
     const refuse = (status: number, reasons: string[], actor?: string) => {
       p.state = "rejected";
+      store.save();
       return reject(res, status, reasons, orderId, actor);
     };
     if (!(p.challenge.exp >= Math.floor(Date.now() / 1000))) return refuse(410, ["order_expired"]);
@@ -202,8 +194,8 @@ export function createMerchantApp(cfg: SellerConfig) {
       return refuse(400, ["bad_payment_header"]);
     }
     const paymentId = hashOf(payment.payload);
-    if (seenPayments.has(paymentId)) return refuse(409, ["payment_replayed"], proof.badge);
-    seenPayments.add(paymentId);
+    if (store.hasSeenPayment(paymentId)) return refuse(409, ["payment_replayed"], proof.badge);
+    store.markPaymentSeen(paymentId);
 
     // Who is paying, and can they prove it?
     const verdict = await cfg.registry.check(proof.badge);
@@ -223,7 +215,7 @@ export function createMerchantApp(cfg: SellerConfig) {
       if (m.mandate && m.issues.length === 0) {
         const spend = await checkSpend(
           mandateHeader.spend,
-          { agent: p.buyerBadge, asset: m.mandate.asset, orderHash: p.orderHash, account: proof.account, atLeast: cfg.ledger.receivedToday(p.buyerBadge, m.mandate.asset) },
+          { agent: p.buyerBadge, asset: m.mandate.asset, orderHash: p.orderHash, account: proof.account, atLeast: store.received(p.buyerBadge, m.mandate.asset) },
           cfg.verifier,
         );
         issues.push(...spend.issues);
@@ -306,6 +298,8 @@ export function createMerchantApp(cfg: SellerConfig) {
     );
     p.state = "paid";
     p.paid = receipt;
+    store.addReceived(proof.badge, receipt.asset, BigInt(receipt.paid));
+    store.save();
     cfg.ledger.append({ type: "payment_settled", actor: cfg.badge, orderId, data: { amount: receipt.paid, asset: receipt.asset, txHash: s.transaction, buyer: proof.badge, direction: "in" } });
     cfg.ledger.append({ type: "delivery", actor: cfg.badge, orderId, data: { receiptHash: hashOf(receipt) }, privateRecord: receipt });
     res.status(200).setHeader(H.paymentResponse, encodePaymentResponseHeader(s)).json(receipt);
