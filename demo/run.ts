@@ -1,7 +1,9 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { anchorPending } from "../src/core/anchor.js";
 import { formatAmount } from "../src/core/mandate.js";
+import { verifyReceipt } from "../src/core/receipt.js";
 import { accountabilityReport } from "../src/core/report.js";
+import { fetchReceiptProof } from "../src/buyer/agent.js";
 import { buildMockScenario, STEPS } from "./scenario.js";
 
 const c = { dim: "\x1b[2m", green: "\x1b[32m", red: "\x1b[31m", yellow: "\x1b[33m", bold: "\x1b[1m", reset: "\x1b[0m" };
@@ -17,8 +19,10 @@ say(`Merchant FreshMart badge       ${s.shopBadge}  ${c.dim}(business identity)$
 say(`Mandate ${c.dim}${s.kit.mandateHash.slice(0, 16)}${c.reset}: up to 20 USDR per payment, 50 USDR per day, never tobacco, verified businesses only\n`);
 
 let pass = 0;
+const paidOrders: string[] = [];
 for (const [i, step] of STEPS.entries()) {
   const o: any = await step.run(s);
+  if (o.status === "paid") paidOrders.push(o.receipt.orderId);
   const got = o.status === "http" ? (o.code === 403 ? "http403" : `http${o.code}`) : o.status;
   const ok = got === step.expect;
   pass += ok ? 1 : 0;
@@ -39,6 +43,14 @@ const shopAnchor = await anchorPending(s.merchantLedger, s.world.anchorSink(s.sh
 say(`${c.bold}Accountability${c.reset}`);
 say(`   Kit ledger:       ${s.kitLedger.all.length} entries, chain ${s.kitLedger.verify().ok ? "verified" : "BROKEN"}, anchored root ${kitAnchor?.anchor.root.slice(0, 16)} in tx ${kitAnchor?.receipt.txHash.slice(0, 16)}`);
 say(`   FreshMart ledger: ${s.merchantLedger.all.length} entries, chain ${s.merchantLedger.verify().ok ? "verified" : "BROKEN"}, anchored root ${shopAnchor?.anchor.root.slice(0, 16)} in tx ${shopAnchor?.receipt.txHash.slice(0, 16)}`);
+let verified = 0;
+for (const id of paidOrders) {
+  const proof = await fetchReceiptProof(s.shopUrl, id);
+  const v = proof ? await verifyReceipt(proof, { registry: s.world.registry(), verifier: s.world.verifier(), chain: s.world.chainReader() }) : undefined;
+  if (v?.ok) verified++;
+  else say(`   ${c.red}receipt ${id} failed: ${v?.issues.join(", ") ?? "no proof"}${c.reset}`);
+}
+say(`   Receipts:         ${verified}/${paidOrders.length} verified (merchant signature, log entry, Merkle path to anchored root, anchor and payment on chain)`);
 say(`   Kit spent today:  ${formatAmount(s.kit.spentToday(), 6, "USDR")} of 150 USDR balance`);
 
 mkdirSync("out", { recursive: true });
@@ -47,4 +59,4 @@ writeFileSync("out/freshmart-accountability.md", accountabilityReport(s.merchant
 say(`   Reports written to out/kit-accountability.md and out/freshmart-accountability.md`);
 say(`\n${pass}/${STEPS.length} scenarios behaved as expected.`);
 s.close();
-process.exit(pass === STEPS.length ? 0 : 1);
+process.exit(pass === STEPS.length && verified === paidOrders.length ? 0 : 1);

@@ -1,5 +1,5 @@
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
-import { hashOf, merkleRoot, sha256Hex } from "./canonical.js";
+import { hashOf, type MerkleStep, merkleProof, merkleRoot, sha256Hex } from "./canonical.js";
 
 /**
  * Hash-chained, append-only accountability log.
@@ -44,6 +44,22 @@ export interface LedgerEntry {
 }
 
 const GENESIS = sha256Hex("signet:genesis:v1");
+
+/** Recomputes one entry's hash from its own fields (the chain link is checked by AuditLedger.verify). */
+export function entryHashValid(e: LedgerEntry): boolean {
+  try {
+    const { hash, ...base } = e;
+    return typeof hash === "string" && hashOf(base) === hash;
+  } catch {
+    return false;
+  }
+}
+
+/** Where an entry was committed on-chain, and the path from it to the anchored root. */
+export interface InclusionProof {
+  anchor: { txHash: string; network: string; from: number; to: number; root: string };
+  path: MerkleStep[];
+}
 
 export class AuditLedger {
   private entries: LedgerEntry[] = [];
@@ -105,6 +121,16 @@ export class AuditLedger {
       if (this.entries[i].type === "anchor") return i + 1;
     }
     return 0;
+  }
+
+  /** Inclusion proof for entry `seq`, once a later anchor entry covers it; undefined before that. */
+  inclusionProof(seq: number): InclusionProof | undefined {
+    const a = this.entries.find((e) => e.type === "anchor" && Number(e.data.from) <= seq && seq < Number(e.data.to));
+    if (!a) return undefined;
+    const from = Number(a.data.from);
+    const to = Number(a.data.to);
+    const path = merkleProof(this.entries.slice(from, to).map((e) => e.hash), seq - from);
+    return { anchor: { txHash: String(a.data.txHash), network: String(a.data.network), from, to, root: String(a.data.root) }, path };
   }
 
   byOrder(orderId: string): LedgerEntry[] {

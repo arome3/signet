@@ -1,5 +1,7 @@
 import type { BadgeProof, Challenge } from "./challenge.js";
+import type { InclusionProof, LedgerEntry } from "./ledger.js";
 import type { SignedMandate, SignedSpend } from "./mandate.js";
+import type { AccountSignature } from "./signing.js";
 import type { AttributeProof, ConsentResult } from "./types.js";
 
 /**
@@ -83,13 +85,38 @@ export interface PayRequestHeaders {
   consent?: ConsentResult;
 }
 
-export interface Receipt {
+/** What the merchant states about a settled order, signed with its badge account. */
+export interface ReceiptBody {
+  v: 1;
   orderId: string;
   orderHash: string;
   paid: string;
   asset: string;
+  network: string;
   txHash: string;
   explorer?: string;
+  /** Buyer agent badge and the account that paid. */
   buyer: string;
+  payer: string;
+  /** Merchant badge and the account that received the funds. */
   merchant: string;
+  payTo: string;
+  /** Hash of the owner-signed mandate the merchant checked. */
+  mandateHash?: string;
+  settledAt: string;
+}
+
+export interface Receipt extends ReceiptBody {
+  merchantSignature: AccountSignature;
+}
+
+/**
+ * A receipt plus everything needed to check it without trusting the merchant: the merchant's log
+ * entry that commits to it, the Merkle path to the anchored root, and the anchor transaction.
+ * Served by the merchant at GET /receipts/:orderId once the entry's batch is anchored.
+ */
+export interface ReceiptProof extends InclusionProof {
+  v: 1;
+  receipt: Receipt;
+  entry: LedgerEntry;
 }

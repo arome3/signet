@@ -10,6 +10,7 @@ import type {
   AttributeProver,
   AttributeVerifier,
   BadgeVerdict,
+  ChainReader,
   OwnerKind,
   PaymentRail,
 } from "../core/types.js";
@@ -185,6 +186,21 @@ export class MockWorld {
         const txHash = randomHex(32);
         this.dataRegistrations.push({ txHash, sender, data: Buffer.from(data).toString("hex"), ts: new Date().toISOString() });
         return { txHash, network: MOCK_NETWORK, explorerUrl: `mock://tx/${txHash}` };
+      },
+    };
+  }
+
+  /** Finalized-chain view for receipt verification. */
+  chainReader(): ChainReader {
+    return {
+      network: MOCK_NETWORK,
+      registeredData: async (txHash) => {
+        const r = this.dataRegistrations.find((d) => d.txHash === txHash);
+        return r ? { sender: r.sender, data: new Uint8Array(Buffer.from(r.data, "hex")) } : undefined;
+      },
+      transfers: async (txHash) => {
+        const t = this.transfers.get(txHash);
+        return t ? [{ from: t.from, to: t.to, asset: t.asset, amount: t.amount }] : undefined;
       },
     };
   }

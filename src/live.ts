@@ -6,6 +6,7 @@ import { SignetBuyer } from "./buyer/agent.js";
 import { createMerchantApp, type CatalogItem } from "./seller/merchant.js";
 import { ConcordiumAccountProver, ConcordiumAccountVerifier } from "./concordium/account.js";
 import { ConcordiumAnchorSink } from "./concordium/anchor.js";
+import { ConcordiumChainReader } from "./concordium/chain.js";
 import { grpcClient, loadConfig, loadWalletExport } from "./concordium/config.js";
 import { ConcordiumAttributeVerifier, createAgeRequest } from "./concordium/identity.js";
 import { ConcordiumRail } from "./concordium/rail.js";
@@ -46,7 +47,7 @@ export function liveBuyer(opts: { consent?: ConsentProvider; ledgerFile?: string
     consent: opts.consent ?? new TerminalConsent(owner ? new ConcordiumAccountProver(owner) : undefined),
     ledger,
   });
-  return { cfg, grpc, buyer, ledger, badge, anchorSink: new ConcordiumAnchorSink(cfg, grpc, agent, sponsor) };
+  return { cfg, grpc, buyer, ledger, badge, anchorSink: new ConcordiumAnchorSink(cfg, grpc, agent, sponsor), chain: new ConcordiumChainReader(cfg, grpc), registry: new ConcordiumRegistry(cfg, grpc), verifier: new ConcordiumAccountVerifier(grpc) };
 }
 
 export function liveMerchant(catalog: CatalogItem[], opts: { ledgerFile?: string } = {}) {

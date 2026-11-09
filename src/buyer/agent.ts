@@ -4,7 +4,9 @@ import { hashOf, randomHex } from "../core/canonical.js";
 import { checkBadgeProof, encodeHeader, proveBadge } from "../core/challenge.js";
 import { checkSignedMandate, evaluateMandate, type MandateEvaluation, mandateHash, type SignedMandate, signSpend, utcDay } from "../core/mandate.js";
 import type { AuditLedger } from "../core/ledger.js";
-import { H, type MandateHeader, type Receipt, type SignetOffer } from "../core/protocol.js";
+import { H, type MandateHeader, type Receipt, type ReceiptProof, type SignetOffer } from "../core/protocol.js";
+import { receiptBody } from "../core/receipt.js";
+import { verifySigned } from "../core/signing.js";
 import type {
   AccountProver,
   AccountVerifier,
@@ -177,9 +179,22 @@ export class SignetBuyer {
     const settle = decodePaymentResponseHeader(payRes.headers.get(H.paymentResponse) ?? "");
     const receipt = (await payRes.json()) as Receipt;
     ledger.append({ type: "payment_settled", actor: badge, orderId, data: { amount: req.amount, asset: req.asset, txHash: settle.transaction, network: settle.network, merchant: merchant.badge } });
-    ledger.append({ type: "delivery", actor: badge, orderId, data: { receiptHash: hashOf(receipt) }, privateRecord: receipt });
+    // Money has moved, so this cannot undo the purchase; it records whether the receipt is usable evidence.
+    const receiptIssues: string[] = [];
+    if (!(await verifySigned(this.cfg.verifier, receipt.merchantSignature, "signet-receipt", receiptBody(receipt), [merchant.owner, merchant.agentWallet]))) receiptIssues.push("bad_merchant_signature");
+    if (receipt.orderHash !== offer.orderHash || receipt.orderId !== orderId) receiptIssues.push("order_mismatch");
+    if (receipt.paid !== req.amount || receipt.asset !== req.asset || receipt.payTo !== req.payTo) receiptIssues.push("terms_mismatch");
+    if (receipt.txHash !== settle.transaction) receiptIssues.push("tx_mismatch");
+    if (receipt.buyer !== badge || receipt.payer !== this.cfg.prover.account) receiptIssues.push("buyer_mismatch");
+    ledger.append({ type: "delivery", actor: badge, orderId, data: { receiptHash: hashOf(receipt), receiptOk: receiptIssues.length === 0, receiptIssues }, privateRecord: receipt });
     return { status: "paid", receipt, evaluation, consent };
   }
+}
+
+/** Fetches a receipt's inclusion proof from the merchant; undefined while its batch is not anchored yet. */
+export async function fetchReceiptProof(merchantUrl: string, orderId: string, f: typeof fetch = fetch): Promise<ReceiptProof | undefined> {
+  const r = await f(new URL(`/receipts/${encodeURIComponent(orderId)}`, merchantUrl));
+  return r.status === 200 ? ((await r.json()) as ReceiptProof) : undefined;
 }
 
 export function summarizeVerdict(v: BadgeVerdict, ok: boolean, issues: string[]) {

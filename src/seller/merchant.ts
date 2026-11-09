@@ -7,6 +7,7 @@ import { checkApproval } from "../core/consent.js";
 import type { AuditLedger } from "../core/ledger.js";
 import { checkSignedMandate, checkSpend, evaluateMandate, type MandateEvaluation } from "../core/mandate.js";
 import { H, type MandateHeader, type Order, type OrderLine, type Receipt, type SignetOffer } from "../core/protocol.js";
+import { buildReceiptProof, signReceipt } from "../core/receipt.js";
 import type { AccountProver, AccountVerifier, AgentRegistry, AttributeProof, AttributeVerifier, ConsentResult, PaymentRail } from "../core/types.js";
 
 export interface CatalogItem {
@@ -269,22 +270,43 @@ export function createMerchantApp(cfg: SellerConfig) {
 
     const s = await cfg.rail.settle(payment, p.requirements);
     if (!s.success) return refuse(402, [`settlement_failed:${s.errorReason}`], proof.badge);
-    const receipt: Receipt = {
-      orderId,
-      orderHash: p.orderHash,
-      paid: p.requirements.amount,
-      asset: p.requirements.asset,
-      txHash: s.transaction,
-      explorer: cfg.rail.explorerTx?.(s.transaction),
-      buyer: proof.badge,
-      merchant: cfg.badge,
-    };
+    const receipt: Receipt = await signReceipt(
+      {
+        v: 1,
+        orderId,
+        orderHash: p.orderHash,
+        paid: p.requirements.amount,
+        asset: p.requirements.asset,
+        network: s.network ?? cfg.rail.network,
+        txHash: s.transaction,
+        explorer: cfg.rail.explorerTx?.(s.transaction),
+        buyer: proof.badge,
+        payer: v.payer!,
+        merchant: cfg.badge,
+        payTo: p.requirements.payTo,
+        mandateHash: mandateCheck.hash,
+        settledAt: new Date().toISOString(),
+      },
+      cfg.prover,
+    );
     p.state = "paid";
     p.paid = receipt;
     cfg.ledger.append({ type: "payment_settled", actor: cfg.badge, orderId, data: { amount: receipt.paid, asset: receipt.asset, txHash: s.transaction, buyer: proof.badge, direction: "in" } });
     cfg.ledger.append({ type: "delivery", actor: cfg.badge, orderId, data: { receiptHash: hashOf(receipt) }, privateRecord: receipt });
     res.status(200).setHeader(H.paymentResponse, encodePaymentResponseHeader(s)).json(receipt);
   }));
+
+  /**
+   * Receipt with its Merkle inclusion proof. 202 until the log batch holding the receipt's `delivery`
+   * entry has been anchored (anchorPending on this ledger).
+   */
+  app.get("/receipts/:orderId", (req: Request, res: Response) => {
+    const p = pending.get(req.params.orderId);
+    if (!p?.paid) return res.status(404).json({ error: "unknown_receipt" });
+    const proof = buildReceiptProof(cfg.ledger, p.paid);
+    if (!proof) return res.status(202).json({ status: "pending_anchor", receipt: p.paid });
+    res.json(proof);
+  });
 
   return app;
 }

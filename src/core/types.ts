@@ -106,3 +106,14 @@ export interface PaymentRail {
   settle(p: PaymentPayload, req: PaymentRequirements): Promise<SettleResponse>;
   explorerTx?(txHash: string): string | undefined;
 }
+
+/**
+ * Read-only view of finalized chain data, used to verify receipts independently of either party.
+ * Returns undefined when the transaction is unknown or not finalized.
+ */
+export interface ChainReader {
+  readonly network: string;
+  registeredData(txHash: string): Promise<{ sender: string; data: Uint8Array } | undefined>;
+  /** Token transfers in a transaction; amounts in atomic units. */
+  transfers(txHash: string): Promise<{ from: string; to: string; asset: string; amount: string }[] | undefined>;
+}
