@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "agent": "set-by-AGENT_BADGE",
+  "owner": "YOUR_CONCORDIUM_ACCOUNT_ADDRESS",
+  "asset": "USDR",
+  "perPaymentLimit": "20000000",
+  "dailyLimit": "50000000",
+  "hardLimit": "200000000",
+  "allowedCategories": [],
+  "blockedCategories": ["tobacco"],
+  "consentCategories": [],
+  "merchantPolicy": { "requireVerifiedBadge": true, "requireBusinessOwner": true, "allowlist": [] },
+  "validUntil": "2027-03-31T00:00:00Z"
+}
