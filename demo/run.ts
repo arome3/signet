@@ -16,6 +16,7 @@ const s = await buildMockScenario();
 say(`Owner Ada (human identity)     ${c.dim}${s.ada.address}${c.reset}`);
 say(`Agent "Kit" badge              ${s.kitBadge}  ${c.dim}(agent-IDP account, owner revealed only date of birth)${c.reset}`);
 say(`Merchant FreshMart badge       ${s.shopBadge}  ${c.dim}(business identity)${c.reset}`);
+say(`Directory                      ${s.directory.directory.listings.map((l) => `${l.listing.brand} (${l.listing.domain})`).join(", ")} listed${s.refusedListings.map((r) => `; impostor "${r.brand}" refused: ${r.reasons.join(", ")}`).join("")}`);
 say(`Mandate ${c.dim}${s.kit.mandateHash.slice(0, 16)}${c.reset}: up to 20 USDR per payment, 50 USDR per day, never tobacco, verified businesses only\n`);
 
 let pass = 0;

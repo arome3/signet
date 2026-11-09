@@ -165,6 +165,16 @@ describe("merchant-side mandate check (compromised buyer runtime)", () => {
     expect((await post(s, q2.offer.order.id, (await craftPay(s, q2, { spend: otherOrder })).headers)).body.reasons).toContain("spend_wrong_order");
   });
 
+  it("concurrent purchases cannot together exceed the daily limit without asking the owner", async () => {
+    s = await buildMockScenario({ approve: false });
+    const sixEggs = [{ sku: "eggs", qty: 6 }]; // 19.2 USDR: under the per-payment limit; three of them exceed 50/day
+    const outcomes = await Promise.all([1, 2, 3].map(() => s.kit.purchase(s.shopUrl, sixEggs)));
+    expect(outcomes.map((o) => o.status)).toEqual(["paid", "paid", "denied"]);
+    expect(outcomes[2].status === "denied" && outcomes[2].stage).toBe("consent");
+    expect(outcomes[2].status === "denied" && outcomes[2].reasons).toContain("daily_limit_exceeded");
+    expect(s.world.balance(s.kitAccount.address, "USDR")).toBe(USDR(150) - 2n * USDR(19.2));
+  });
+
   it("accepts a correctly built payment (control case)", async () => {
     s = await buildMockScenario();
     const q = await quote(s);

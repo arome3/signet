@@ -4,6 +4,7 @@ import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402
 import { hashOf, randomHex } from "../core/canonical.js";
 import { type BadgeProof, type Challenge, checkBadgeProof, decodeHeader, newChallenge, proveBadge } from "../core/challenge.js";
 import { checkApproval } from "../core/consent.js";
+import type { Listing } from "../core/directory.js";
 import type { AuditLedger } from "../core/ledger.js";
 import { checkSignedMandate, checkSpend, evaluateMandate, type MandateEvaluation } from "../core/mandate.js";
 import { H, type MandateHeader, type Order, type OrderLine, type Receipt, type SignetOffer } from "../core/protocol.js";
@@ -17,6 +18,20 @@ export interface CatalogItem {
   category: string;
   /** Minimum age of the buyer's accountable owner. */
   ageRestricted?: number;
+}
+
+/** The merchant's directory listing for its catalog (sign it with signListing). */
+export function catalogListing(m: { badge: string; name: string; domain: string; asset: string; catalog: CatalogItem[] }, endpoint: string): Listing {
+  return {
+    v: 1,
+    badge: m.badge,
+    brand: m.name,
+    domain: m.domain,
+    endpoint,
+    asset: m.asset,
+    items: m.catalog.map((c) => ({ sku: c.sku, name: c.name, unitPrice: c.unitPrice.toString(), category: c.category })),
+    issuedAt: new Date().toISOString(),
+  };
 }
 
 export interface SellerPolicy {

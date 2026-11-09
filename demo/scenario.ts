@@ -5,7 +5,8 @@ import { AuditLedger } from "../src/core/ledger.js";
 import { mandateHash, parseMandate, signMandate, type Mandate } from "../src/core/mandate.js";
 import type { ConsentProvider, ConsentRequest } from "../src/core/types.js";
 import { SignetBuyer, type PurchaseOutcome } from "../src/buyer/agent.js";
-import { createMerchantApp, type CatalogItem } from "../src/seller/merchant.js";
+import { buildDirectory, signListing } from "../src/core/directory.js";
+import { catalogListing, createMerchantApp, type CatalogItem } from "../src/seller/merchant.js";
 import { MockWorld } from "../src/mock/world.js";
 
 export const USDR = (n: number) => BigInt(Math.round(n * 1_000_000));
@@ -50,7 +51,14 @@ async function listen(app: ReturnType<typeof createMerchantApp>): Promise<{ url:
  *  - "FreshMart" impostor: registered, but its Agent Card was tampered with.
  *  - Teen-owned agent and an unregistered rogue script.
  */
-export async function buildMockScenario(opts: { consent?: ConsentProvider; approve?: boolean | ((r: ConsentRequest) => boolean) } = {}) {
+export async function buildMockScenario(
+  opts: {
+    consent?: ConsentProvider;
+    approve?: boolean | ((r: ConsentRequest) => boolean);
+    /** What FreshMart actually charges; its directory listing always shows CATALOG. */
+    shopCatalog?: CatalogItem[];
+  } = {},
+) {
   const world = new MockWorld();
 
   const ada = world.createAccount("human", { dob: "1995-04-12" });
@@ -77,7 +85,7 @@ export async function buildMockScenario(opts: { consent?: ConsentProvider; appro
     badge: shopBadge,
     payTo: shop.address,
     asset: "USDR",
-    catalog: CATALOG,
+    catalog: opts.shopCatalog ?? CATALOG,
     prover: world.prover(shop.address),
     rail: world.rail(),
     registry: world.registry(),
@@ -87,6 +95,7 @@ export async function buildMockScenario(opts: { consent?: ConsentProvider; appro
   });
   const fakeApp = createMerchantApp({
     name: "FreshMart",
+    domain: "freshmart.example",
     badge: fakeBadge,
     payTo: fake.address,
     asset: "USDR",
@@ -100,6 +109,22 @@ export async function buildMockScenario(opts: { consent?: ConsentProvider; appro
   });
   const shopSrv = await listen(merchantApp);
   const fakeSrv = await listen(fakeApp);
+
+  // Directory: FreshMart proves freshmart.example in DNS and lists its catalog. The impostor also
+  // applies as "FreshMart" and is refused. Mock endpoints are loopback, so that is allowed here only.
+  world.proveDomain("freshmart.example", shop.address);
+  const operator = world.createAccount("business");
+  const shopInfo = { badge: shopBadge, name: "FreshMart", domain: "freshmart.example", asset: "USDR", catalog: CATALOG };
+  const domains = world.domainVerifier();
+  const { directory, refused: refusedListings } = await buildDirectory(
+    [
+      await signListing(catalogListing(shopInfo, shopSrv.url), world.prover(shop.address)),
+      await signListing(catalogListing({ ...shopInfo, badge: fakeBadge }, fakeSrv.url), world.prover(fake.address)),
+    ],
+    world.prover(operator.address),
+    { registry: world.registry(), verifier: world.verifier(), domains, allowLoopbackEndpoints: true },
+  );
+  const directoryCfg = { listings: directory, operator: operator.address, domains, allowLoopbackEndpoints: true };
 
   const kitLedger = new AuditLedger();
   // Ada signs Kit's mandate with her own account and publishes its hash on Kit's badge.
@@ -117,6 +142,7 @@ export async function buildMockScenario(opts: { consent?: ConsentProvider; appro
     // Simulated Ada: approves and signs with her key, so FreshMart can check the approval itself.
     consent: opts.consent ?? new AutoConsent(opts.approve ?? true, world.prover(ada.address)),
     ledger: kitLedger,
+    directory: directoryCfg,
   });
   kitLedger.append({ type: "mandate_published", actor: kitBadge, data: { mandate: kit.mandateHash, owner: ada.address, asset: mandate.asset, perPaymentLimit: mandate.perPaymentLimit, dailyLimit: mandate.dailyLimit } });
 
@@ -132,6 +158,7 @@ export async function buildMockScenario(opts: { consent?: ConsentProvider; appro
     verifier: world.verifier(),
     consent: new AutoConsent(true, world.prover(teen.address)),
     ledger: new AuditLedger(),
+    directory: directoryCfg,
   });
 
   const close = () => {
@@ -139,7 +166,7 @@ export async function buildMockScenario(opts: { consent?: ConsentProvider; appro
     fakeSrv.server.close();
   };
 
-  return { world, ada, kitAccount, kitBadge, kit, kitLedger, signedMandate, shop, shopBadge, shopUrl: shopSrv.url, fakeUrl: fakeSrv.url, merchantLedger, teenAgent, teenBadge, close };
+  return { world, ada, kitAccount, kitBadge, kit, kitLedger, signedMandate, directory, directoryCfg, refusedListings, operator, fake, fakeBadge, shop, shopBadge, shopUrl: shopSrv.url, fakeUrl: fakeSrv.url, merchantLedger, teenAgent, teenBadge, close };
 }
 
 export type Scenario = Awaited<ReturnType<typeof buildMockScenario>>;

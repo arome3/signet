@@ -10,6 +10,7 @@
     "demo:live": "tsx demo/live.ts",
     "mcp": "tsx src/mcp/server.ts",
     "mandate:sign": "tsx scripts/sign-mandate.ts",
+    "directory:build": "tsx scripts/build-directory.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

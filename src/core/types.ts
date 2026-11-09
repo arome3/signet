@@ -117,3 +117,11 @@ export interface ChainReader {
   /** Token transfers in a transaction; amounts in atomic units. */
   transfers(txHash: string): Promise<{ from: string; to: string; asset: string; amount: string }[] | undefined>;
 }
+
+/**
+ * Proves a domain belongs to an account: the domain publishes a DNS TXT record at `_signet.<domain>`
+ * with the value `signet-account=<account>`. The merchant's signed listing proves the other direction.
+ */
+export interface DomainVerifier {
+  verify(domain: string, account: string): Promise<boolean>;
+}

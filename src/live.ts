@@ -7,6 +7,9 @@ import { createMerchantApp, type CatalogItem } from "./seller/merchant.js";
 import { ConcordiumAccountProver, ConcordiumAccountVerifier } from "./concordium/account.js";
 import { ConcordiumAnchorSink } from "./concordium/anchor.js";
 import { ConcordiumChainReader } from "./concordium/chain.js";
+import { DnsDomainVerifier } from "./concordium/domain.js";
+import type { SignedDirectory } from "./core/directory.js";
+import { readFileSync } from "node:fs";
 import { grpcClient, loadConfig, loadWalletExport } from "./concordium/config.js";
 import { ConcordiumAttributeVerifier, createAgeRequest } from "./concordium/identity.js";
 import { ConcordiumRail } from "./concordium/rail.js";
@@ -21,6 +24,18 @@ function need(name: string): string {
   const v = process.env[name];
   if (!v) throw new Error(`missing env ${name} (see .env.example)`);
   return v;
+}
+
+/** Signed directory written by `npm run directory:build`; refuses to start without one (fail closed). */
+function loadDirectory() {
+  const path = process.env.DIRECTORY_FILE ?? "out/directory.json";
+  let listings: SignedDirectory;
+  try {
+    listings = JSON.parse(readFileSync(path, "utf8")) as SignedDirectory;
+  } catch (e) {
+    throw new Error(`cannot read merchant directory ${path} (${(e as Error).message}); run \`npm run directory:build\``);
+  }
+  return { listings, operator: need("DIRECTORY_OPERATOR"), domains: new DnsDomainVerifier(), allowLoopbackEndpoints: process.env.SIGNET_ALLOW_LOOPBACK_ENDPOINTS === "1" };
 }
 
 export function liveBuyer(opts: { consent?: ConsentProvider; ledgerFile?: string } = {}) {
@@ -46,6 +61,7 @@ export function liveBuyer(opts: { consent?: ConsentProvider; ledgerFile?: string
     verifier: new ConcordiumAccountVerifier(grpc),
     consent: opts.consent ?? new TerminalConsent(owner ? new ConcordiumAccountProver(owner) : undefined),
     ledger,
+    directory: loadDirectory(),
   });
   return { cfg, grpc, buyer, ledger, badge, anchorSink: new ConcordiumAnchorSink(cfg, grpc, agent, sponsor), chain: new ConcordiumChainReader(cfg, grpc), registry: new ConcordiumRegistry(cfg, grpc), verifier: new ConcordiumAccountVerifier(grpc) };
 }

@@ -2,6 +2,7 @@ import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePayment
 import type { PaymentRequired } from "@x402/core/types";
 import { hashOf, randomHex } from "../core/canonical.js";
 import { checkBadgeProof, encodeHeader, proveBadge } from "../core/challenge.js";
+import { checkMerchantListing, checkPrices, type SignedDirectory } from "../core/directory.js";
 import { checkSignedMandate, evaluateMandate, type MandateEvaluation, mandateHash, type SignedMandate, signSpend, utcDay } from "../core/mandate.js";
 import type { AuditLedger } from "../core/ledger.js";
 import { H, type MandateHeader, type Receipt, type ReceiptProof, type SignetOffer } from "../core/protocol.js";
@@ -16,6 +17,7 @@ import type {
   BadgeVerdict,
   ConsentProvider,
   ConsentResult,
+  DomainVerifier,
   PaymentRail,
 } from "../core/types.js";
 
@@ -31,6 +33,15 @@ export interface BuyerConfig {
   verifier: AccountVerifier;
   consent: ConsentProvider;
   ledger: AuditLedger;
+  /** Verified-merchant directory. The buyer only pays listed merchants, at listed prices. */
+  directory: {
+    listings: SignedDirectory;
+    /** Account of the directory operator this agent trusts. */
+    operator: string;
+    domains: DomainVerifier;
+    /** Mock and local development only. */
+    allowLoopbackEndpoints?: boolean;
+  };
   fetch?: typeof fetch;
 }
 
@@ -61,7 +72,16 @@ export class SignetBuyer {
     return this.cfg.ledger.spentToday(this.cfg.badge, this.mandate.asset);
   }
 
-  async purchase(merchantUrl: string, items: { sku: string; qty: number }[]): Promise<PurchaseOutcome> {
+  /** Purchases run one at a time so each mandate check and spend statement sees every earlier payment. */
+  private queue: Promise<unknown> = Promise.resolve();
+
+  purchase(merchantUrl: string, items: { sku: string; qty: number }[]): Promise<PurchaseOutcome> {
+    const run = this.queue.then(() => this.purchaseNow(merchantUrl, items));
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
+  private async purchaseNow(merchantUrl: string, items: { sku: string; qty: number }[]): Promise<PurchaseOutcome> {
     const { badge, ledger } = this.cfg;
     const nonce = randomHex(16);
 
@@ -109,8 +129,18 @@ export class SignetBuyer {
       )),
     );
     if (req.payTo !== merchant.owner && req.payTo !== merchant.agentWallet) merchantIssues.push("payto_not_bound_to_badge");
+    // Directory: badge, brand, domain and endpoint bound together; then listed price vs asked price.
+    const d = this.cfg.directory;
+    const listed = await checkMerchantListing(
+      d.listings,
+      d.operator,
+      { badge: offer.merchant.badge, name: offer.merchant.name, domain: offer.merchant.domain, contactedUrl: merchantUrl },
+      { registry: this.cfg.registry, verifier: this.cfg.verifier, domains: d.domains, allowLoopbackEndpoints: d.allowLoopbackEndpoints },
+    );
+    merchantIssues.push(...listed.issues);
+    if (listed.listing) merchantIssues.push(...checkPrices(offer.order, listed.listing, items));
     const merchantOk = merchant.verified && merchantIssues.length === 0;
-    ledger.append({ type: "counterparty_check", actor: badge, orderId, data: summarizeVerdict(merchant, merchantOk, merchantIssues) });
+    ledger.append({ type: "counterparty_check", actor: badge, orderId, data: { ...summarizeVerdict(merchant, merchantOk, merchantIssues), brand: listed.listing?.brand, domain: listed.listing?.domain } });
 
     // 3. Mandate.
     const evaluation = evaluateMandate(
@@ -125,7 +155,10 @@ export class SignetBuyer {
       this.spentToday(),
     );
     ledger.append({ type: "mandate_check", actor: badge, orderId, data: { decision: evaluation.decision, reasons: evaluation.reasons, mandate: this.mandateHash, spentToday: evaluation.spentToday, projected: evaluation.projectedToday } });
-    if (evaluation.decision === "deny") return { status: "denied", stage: merchantOk ? "mandate" : "merchant", reasons: evaluation.reasons, evaluation };
+    if (evaluation.decision === "deny") {
+      const reasons = merchantOk ? evaluation.reasons : [...evaluation.reasons, ...merchantIssues.filter((i) => !evaluation.reasons.includes(i))];
+      return { status: "denied", stage: merchantOk ? "mandate" : "merchant", reasons, evaluation };
+    }
 
     // 4. Owner consent when outside the mandate.
     let consent: ConsentResult | undefined;

@@ -23,7 +23,7 @@ It plugs into any agent through an **MCP server** (`signet_buy`, `signet_audit`,
 
 ```bash
 npm install
-npm test          # 26 tests: mandate engine, ledger, anchors, protocol attacks, Concordium SDK signing
+npm test          # 83 tests: mandate engine, ledger, anchors, receipts, directory, protocol attacks, SDK signing
 npm run demo      # 7-scenario shopping demo on a local mock of Concordium
 ```
 
@@ -37,7 +37,13 @@ The demo runs these scenarios:
 6. **Teen-owned agent buying wine:** the age proof fails, so the merchant refuses.
 7. **Anonymous script:** gets a 403 before it is ever quoted a price.
 
-Both sides' logs are anchored, and reports are written to `out/`.
+Both sides' logs are anchored, every receipt is verified against the anchored log and the payment, and reports are written to `out/`.
+
+What the merchant and buyer each check before money moves:
+
+- **Merchant:** buyer badge and proof of control for this session and order; the owner-signed mandate (signature, published hash, agent, validity); its own mandate decision on the order, using the agent's signed spend-so-far (never below what the merchant has already received); an owner-signed approval when the mandate says ask; the age proof; payer = proven account. Each order and each signed payment is accepted once.
+- **Buyer:** merchant badge and proof of control; a listing in the signed merchant directory that binds badge, brand, domain (DNS TXT proof) and endpoint; every quoted line at its listed price and category, exactly the items asked for; its own mandate and the owner's approval.
+- **Anyone:** `verifyReceipt()` checks a receipt's merchant signature, the log entry that commits to it, the Merkle path to the anchored root, the anchor transaction's sender and contents, and the payment on chain.
 
 ## Use from Claude / any MCP client
 
@@ -55,19 +61,23 @@ Mock mode starts a local FreshMart automatically. Ask your assistant to "buy 2 l
 2. Request test CCD for the facilitator account (Activity > Request CCD).
 3. Get a payment stablecoin on testnet. Either use USDR, if you hold some, or request your own via the PLT issuance form. Set `SIGNET_ASSET`.
 4. Register both agents at https://agent-registry.concordium.com (testnet), host each Agent Card and set the URL and hash.
-5. Export both accounts from the Browser Wallet into `keys/`, then fill in `.env` from `.env.example`.
-6. Run `npm run demo:live`. It prints CCDExplorer links for the payments and the log anchors.
+5. Export the accounts from the Browser Wallet into `keys/`, then fill in `.env` from `.env.example`.
+6. Owner signs the mandate: `npm run mandate:sign`, then publish the printed hash as the agent badge's `signet.mandate` metadata.
+7. Merchant proves its domain with a DNS TXT record `_signet.<domain>` = `signet-account=<merchant account>`, then `npm run directory:build` signs the listing and the directory.
+8. Run `npm run demo:live`. It prints CCDExplorer links for the payments and the log anchors.
 
 ## Layout
 
 ```
-src/core        mandate engine, hash-chained ledger, anchors, challenges, consent, report, wire protocol
+src/core        mandate engine + signatures, hash-chained ledger, anchors, challenges, consent, receipts,
+                merchant directory, report, wire protocol
 src/buyer       SignetBuyer: verify merchant -> mandate -> consent -> prove -> pay -> log
 src/seller      Express merchant: gate unverified agents, quote over x402, ZK age check, verify+settle
 src/concordium  live adapters: Agent Registry MCP + gRPC, @x402/concordium rail, RegisterData anchors,
                 Verify & Access age requests, ID App consent
 src/mock        offline Concordium stand-in used by tests and the demo
 src/mcp         MCP server for any agent framework
+scripts         mandate:sign, directory:build (testnet setup)
 demo            scenario, offline runner, testnet runner
 ```
 

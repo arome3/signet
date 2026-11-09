@@ -11,6 +11,7 @@ import type {
   AttributeVerifier,
   BadgeVerdict,
   ChainReader,
+  DomainVerifier,
   OwnerKind,
   PaymentRail,
 } from "../core/types.js";
@@ -50,6 +51,8 @@ export class MockWorld {
   /** Settled transfers by tx hash (stands in for the chain; a tx can only be included once). */
   transfers = new Map<string, { from: string; to: string; asset: string; amount: string; sponsor: string }>();
   facilitator: string;
+  /** Mock DNS: TXT records at _signet.<domain>. */
+  dnsTxt = new Map<string, string[]>();
   /** Simulated time to finality for settlements (tests use it to force overlapping requests). */
   settleLatencyMs = 0;
 
@@ -188,6 +191,15 @@ export class MockWorld {
         return { txHash, network: MOCK_NETWORK, explorerUrl: `mock://tx/${txHash}` };
       },
     };
+  }
+
+  /** Publishes `_signet.<domain> TXT "signet-account=<account>"` in the mock DNS. */
+  proveDomain(domain: string, account: string) {
+    this.dnsTxt.set(`_signet.${domain.toLowerCase()}`, [`signet-account=${account}`]);
+  }
+
+  domainVerifier(): DomainVerifier {
+    return { verify: async (domain, account) => (this.dnsTxt.get(`_signet.${domain.toLowerCase()}`) ?? []).includes(`signet-account=${account}`) };
   }
 
   /** Finalized-chain view for receipt verification. */
