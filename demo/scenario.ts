@@ -57,6 +57,7 @@ export async function buildMockScenario(
     approve?: boolean | ((r: ConsentRequest) => boolean);
     /** What FreshMart actually charges; its directory listing always shows CATALOG. */
     shopCatalog?: CatalogItem[];
+    approvalTimeoutMs?: number;
   } = {},
 ) {
   const world = new MockWorld();
@@ -143,6 +144,7 @@ export async function buildMockScenario(
     consent: opts.consent ?? new AutoConsent(opts.approve ?? true, world.prover(ada.address)),
     ledger: kitLedger,
     directory: directoryCfg,
+    approvalTimeoutMs: opts.approvalTimeoutMs,
   });
   kitLedger.append({ type: "mandate_published", actor: kitBadge, data: { mandate: kit.mandateHash, owner: ada.address, asset: mandate.asset, perPaymentLimit: mandate.perPaymentLimit, dailyLimit: mandate.dailyLimit } });
 

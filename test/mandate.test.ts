@@ -169,9 +169,10 @@ describe("merchant-side mandate check (compromised buyer runtime)", () => {
     s = await buildMockScenario({ approve: false });
     const sixEggs = [{ sku: "eggs", qty: 6 }]; // 19.2 USDR: under the per-payment limit; three of them exceed 50/day
     const outcomes = await Promise.all([1, 2, 3].map(() => s.kit.purchase(s.shopUrl, sixEggs)));
-    expect(outcomes.map((o) => o.status)).toEqual(["paid", "paid", "denied"]);
-    expect(outcomes[2].status === "denied" && outcomes[2].stage).toBe("consent");
-    expect(outcomes[2].status === "denied" && outcomes[2].reasons).toContain("daily_limit_exceeded");
+    expect(outcomes.map((o) => o.status).sort()).toEqual(["denied", "paid", "paid"]);
+    const refused = outcomes.find((o) => o.status === "denied")!;
+    expect(refused.status === "denied" && refused.stage).toBe("consent");
+    expect(refused.status === "denied" && refused.reasons).toContain("daily_limit_exceeded");
     expect(s.world.balance(s.kitAccount.address, "USDR")).toBe(USDR(150) - 2n * USDR(19.2));
   });
 

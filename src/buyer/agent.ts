@@ -1,6 +1,7 @@
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from "@x402/core/http";
 import type { PaymentRequired } from "@x402/core/types";
 import { hashOf, randomHex } from "../core/canonical.js";
+import { Mutex, withTimeout } from "../core/lock.js";
 import { checkBadgeProof, encodeHeader, proveBadge } from "../core/challenge.js";
 import { checkMerchantListing, checkPrices, type SignedDirectory } from "../core/directory.js";
 import { checkSignedMandate, evaluateMandate, type MandateEvaluation, mandateHash, type SignedMandate, signSpend, utcDay } from "../core/mandate.js";
@@ -42,6 +43,8 @@ export interface BuyerConfig {
     /** Mock and local development only. */
     allowLoopbackEndpoints?: boolean;
   };
+  /** How long to wait for the owner's answer before treating it as "no". Default 10 minutes. */
+  approvalTimeoutMs?: number;
   fetch?: typeof fetch;
 }
 
@@ -72,16 +75,41 @@ export class SignetBuyer {
     return this.cfg.ledger.spentToday(this.cfg.badge, this.mandate.asset);
   }
 
-  /** Purchases run one at a time so each mandate check and spend statement sees every earlier payment. */
-  private queue: Promise<unknown> = Promise.resolve();
+  /**
+   * Spend reservations. When the mandate allows a purchase (or sends it to the owner), its amount is
+   * held against the daily limit until it settles (converted into a ledger entry) or is refused,
+   * declined or times out (released). Purchases run in parallel; one waiting for the owner does not
+   * block others, but its amount counts while it waits. If the outcome of a pay request is unknown
+   * (network error), the hold is kept for the rest of the UTC day: the payment may have gone through.
+   */
+  private readonly reservations = new Map<string, { amount: bigint; asset: string; day: string }>();
+  /** Held only while reading spend and placing a reservation (no I/O inside). */
+  private readonly reserveLock = new Mutex();
+  /**
+   * Held from signing the spend statement until the payment is settled or refused, so payments settle
+   * one at a time and each statement includes every payment that settled before it. Never held while
+   * waiting for the owner.
+   */
+  private readonly payLock = new Mutex();
 
-  purchase(merchantUrl: string, items: { sku: string; qty: number }[]): Promise<PurchaseOutcome> {
-    const run = this.queue.then(() => this.purchaseNow(merchantUrl, items));
-    this.queue = run.catch(() => undefined);
-    return run;
+  /** Amount held for purchases in progress today (excluding `except`). */
+  reservedToday(except?: string): bigint {
+    const day = utcDay();
+    let sum = 0n;
+    for (const [id, r] of this.reservations) if (id !== except && r.day === day && r.asset === this.mandate.asset) sum += r.amount;
+    return sum;
   }
 
-  private async purchaseNow(merchantUrl: string, items: { sku: string; qty: number }[]): Promise<PurchaseOutcome> {
+  async purchase(merchantUrl: string, items: { sku: string; qty: number }[]): Promise<PurchaseOutcome> {
+    const hold: Hold = { keep: false };
+    try {
+      return await this.purchaseNow(merchantUrl, items, hold);
+    } finally {
+      if (hold.id && !hold.keep) this.reservations.delete(hold.id);
+    }
+  }
+
+  private async purchaseNow(merchantUrl: string, items: { sku: string; qty: number }[], hold: Hold): Promise<PurchaseOutcome> {
     const { badge, ledger } = this.cfg;
     const nonce = randomHex(16);
 
@@ -142,27 +170,31 @@ export class SignetBuyer {
     const merchantOk = merchant.verified && merchantIssues.length === 0;
     ledger.append({ type: "counterparty_check", actor: badge, orderId, data: { ...summarizeVerdict(merchant, merchantOk, merchantIssues), brand: listed.listing?.brand, domain: listed.listing?.domain } });
 
-    // 3. Mandate.
-    const evaluation = evaluateMandate(
-      this.mandate,
-      {
-        merchant: { badge: merchant.badge, verified: merchantOk, business: merchant.ownerKind === "business" },
-        asset: req.asset,
-        amount: BigInt(req.amount),
-        categories: offer.order.categories,
-        description: offer.order.lines.map((l) => `${l.qty}x ${l.name}`).join(", "),
-      },
-      this.spentToday(),
-    );
-    ledger.append({ type: "mandate_check", actor: badge, orderId, data: { decision: evaluation.decision, reasons: evaluation.reasons, mandate: this.mandateHash, spentToday: evaluation.spentToday, projected: evaluation.projectedToday } });
+    // 3. Mandate, against settled spend plus everything held by purchases in progress; reserve.
+    const amount = BigInt(req.amount);
+    const intent = {
+      merchant: { badge: merchant.badge, verified: merchantOk, business: merchant.ownerKind === "business" },
+      asset: req.asset,
+      amount,
+      categories: offer.order.categories,
+      description: offer.order.lines.map((l) => `${l.qty}x ${l.name}`).join(", "),
+    };
+    const evaluation = await this.reserveLock.run(() => {
+      const ev = evaluateMandate(this.mandate, intent, this.spentToday() + this.reservedToday());
+      if (ev.decision !== "deny") {
+        this.reservations.set(orderId, { amount, asset: this.mandate.asset, day: utcDay() });
+        hold.id = orderId;
+      }
+      return ev;
+    });
+    ledger.append({ type: "mandate_check", actor: badge, orderId, data: { decision: evaluation.decision, reasons: evaluation.reasons, mandate: this.mandateHash, spentToday: evaluation.spentToday, projected: evaluation.projectedToday, reserved: evaluation.decision !== "deny" } });
     if (evaluation.decision === "deny") {
       const reasons = merchantOk ? evaluation.reasons : [...evaluation.reasons, ...merchantIssues.filter((i) => !evaluation.reasons.includes(i))];
       return { status: "denied", stage: merchantOk ? "mandate" : "merchant", reasons, evaluation };
     }
 
-    // 4. Owner consent when outside the mandate.
-    let consent: ConsentResult | undefined;
-    if (evaluation.decision === "consent") {
+    // 4. Owner consent when outside the mandate (no lock held while waiting).
+    const askOwner = async (reasons: string[]): Promise<ConsentResult | PurchaseOutcome> => {
       const creq = {
         orderId,
         orderHash: offer.orderHash,
@@ -170,15 +202,26 @@ export class SignetBuyer {
         owner: this.mandate.owner,
         merchantBadge: merchant.badge,
         merchantName: offer.merchant.name,
-        amount: BigInt(req.amount),
+        amount,
         asset: req.asset,
-        summary: offer.order.lines.map((l) => `${l.qty}x ${l.name}`).join(", "),
-        reasons: evaluation.reasons,
+        summary: intent.description,
+        reasons,
       };
-      ledger.append({ type: "consent_requested", actor: badge, orderId, data: { reasons: evaluation.reasons } });
-      consent = await this.cfg.consent.request(creq);
-      ledger.append({ type: "consent_result", actor: badge, orderId, data: { approved: consent.approved, method: consent.method, textHash: consent.textHash, requestAnchorTx: consent.requestAnchorTx, auditAnchorTx: consent.auditAnchorTx } });
-      if (!consent.approved) return { status: "denied", stage: "consent", reasons: ["owner_declined", ...evaluation.reasons], evaluation };
+      ledger.append({ type: "consent_requested", actor: badge, orderId, data: { reasons } });
+      const answer = await withTimeout(this.cfg.consent.request(creq), this.cfg.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS);
+      if (!answer) {
+        ledger.append({ type: "consent_result", actor: badge, orderId, data: { approved: false, method: "timeout" } });
+        return { status: "denied", stage: "consent", reasons: ["approval_timeout", ...reasons], evaluation };
+      }
+      ledger.append({ type: "consent_result", actor: badge, orderId, data: { approved: answer.approved, method: answer.method, textHash: answer.textHash, requestAnchorTx: answer.requestAnchorTx, auditAnchorTx: answer.auditAnchorTx } });
+      if (!answer.approved) return { status: "denied", stage: "consent", reasons: ["owner_declined", ...reasons], evaluation };
+      return answer;
+    };
+    let consent: ConsentResult | undefined;
+    if (evaluation.decision === "consent") {
+      const r = await askOwner(evaluation.reasons);
+      if ("status" in r) return r;
+      consent = r;
     }
 
     // 5. Prove our badge and any required attributes, sign the payment.
@@ -188,41 +231,82 @@ export class SignetBuyer {
       if (!this.cfg.attributes) return { status: "denied", stage: "seller", reasons: ["age_proof_required_but_no_prover"], evaluation };
       attest.push(await this.cfg.attributes.prove("age_over", offer.requires.ageOver, offer.challenge.nonce, offer.requires.ageRequest));
     }
-    const spend = await signSpend({ agent: badge, asset: this.mandate.asset, day: utcDay(), spent: evaluation.spentToday.toString(), orderHash: offer.orderHash }, this.cfg.prover);
-    const mandateHeader: MandateHeader = { mandate: this.cfg.mandate, spend };
     const payment = await this.cfg.rail.createPayment(req);
     ledger.append({ type: "payment_signed", actor: badge, orderId, data: { amount: req.amount, asset: req.asset, payTo: req.payTo, network: req.network } });
 
-    const payRes = await this.f(new URL(`/orders/${orderId}/pay`, merchantUrl), {
-      method: "POST",
-      headers: {
-        [H.paymentSignature]: encodePaymentSignatureHeader(payment),
-        [H.proof]: encodeHeader(proof),
-        [H.attest]: encodeHeader(attest),
-        [H.mandate]: encodeHeader(mandateHeader),
-        ...(consent ? { [H.consent]: encodeHeader(consent) } : {}),
-      },
-    });
-    if (payRes.status !== 200) {
-      const body = await payRes.json().catch(() => ({}));
-      const reasons = (body as { reasons?: string[] }).reasons ?? [`status_${payRes.status}`];
-      ledger.append({ type: "payment_rejected", actor: badge, orderId, data: { reasons } });
-      return { status: "denied", stage: "seller", reasons, evaluation };
+    // 6. Pay. Under the payment lock: state spend-so-far as what has settled (truthful, and never below
+    // what any merchant has received, since every payment of this agent settles under this lock), re-check
+    // the mandate with that figure exactly as the merchant will, send, and convert the hold on settlement.
+    // If a purchase that started later settled first and pushed this one outside the mandate, release the
+    // lock, ask the owner, and try once more. Holds of purchases still in progress are not counted here:
+    // each of them already counted this one when it reserved.
+    type Attempt = { kind: "needs_approval"; reasons: string[] } | { kind: "done"; outcome: PurchaseOutcome };
+    const attempt = (): Promise<Attempt> =>
+      this.payLock.run(async (): Promise<Attempt> => {
+        const spentBefore = this.spentToday();
+        const now = evaluateMandate(this.mandate, intent, spentBefore);
+        if (now.decision === "deny") return { kind: "done", outcome: { status: "denied", stage: "mandate", reasons: now.reasons, evaluation: now } };
+        if (now.decision === "consent" && !consent) return { kind: "needs_approval", reasons: now.reasons };
+        const spend = await signSpend({ agent: badge, asset: this.mandate.asset, day: utcDay(), spent: spentBefore.toString(), orderHash: offer.orderHash }, this.cfg.prover);
+        const mandateHeader: MandateHeader = { mandate: this.cfg.mandate, spend };
+        let payRes: Response;
+        try {
+          payRes = await this.f(new URL(`/orders/${orderId}/pay`, merchantUrl), {
+            method: "POST",
+            headers: {
+              [H.paymentSignature]: encodePaymentSignatureHeader(payment),
+              [H.proof]: encodeHeader(proof),
+              [H.attest]: encodeHeader(attest),
+              [H.mandate]: encodeHeader(mandateHeader),
+              ...(consent ? { [H.consent]: encodeHeader(consent) } : {}),
+            },
+          });
+        } catch (e) {
+          hold.keep = true;
+          ledger.append({ type: "payment_rejected", actor: badge, orderId, data: { reasons: ["payment_outcome_unknown"], error: String((e as Error).message).slice(0, 120) } });
+          return { kind: "done", outcome: { status: "denied", stage: "seller", reasons: ["payment_outcome_unknown"], evaluation: now } };
+        }
+        if (payRes.status !== 200) {
+          const body = await payRes.json().catch(() => ({}));
+          const reasons = (body as { reasons?: string[] }).reasons ?? [`status_${payRes.status}`];
+          ledger.append({ type: "payment_rejected", actor: badge, orderId, data: { reasons } });
+          return { kind: "done", outcome: { status: "denied", stage: "seller", reasons, evaluation: now } };
+        }
+        const settle = decodePaymentResponseHeader(payRes.headers.get(H.paymentResponse) ?? "");
+        const receipt = (await payRes.json()) as Receipt;
+        // Convert the hold: the settled entry and the removal happen together (no await in between).
+        ledger.append({ type: "payment_settled", actor: badge, orderId, data: { amount: req.amount, asset: req.asset, txHash: settle.transaction, network: settle.network, merchant: merchant.badge } });
+        this.reservations.delete(orderId);
+        hold.id = undefined;
+        // Money has moved, so this cannot undo the purchase; it records whether the receipt is usable evidence.
+        const receiptIssues: string[] = [];
+        if (!(await verifySigned(this.cfg.verifier, receipt.merchantSignature, "signet-receipt", receiptBody(receipt), [merchant.owner, merchant.agentWallet]))) receiptIssues.push("bad_merchant_signature");
+        if (receipt.orderHash !== offer.orderHash || receipt.orderId !== orderId) receiptIssues.push("order_mismatch");
+        if (receipt.paid !== req.amount || receipt.asset !== req.asset || receipt.payTo !== req.payTo) receiptIssues.push("terms_mismatch");
+        if (receipt.txHash !== settle.transaction) receiptIssues.push("tx_mismatch");
+        if (receipt.buyer !== badge || receipt.payer !== this.cfg.prover.account) receiptIssues.push("buyer_mismatch");
+        ledger.append({ type: "delivery", actor: badge, orderId, data: { receiptHash: hashOf(receipt), receiptOk: receiptIssues.length === 0, receiptIssues }, privateRecord: receipt });
+        return { kind: "done", outcome: { status: "paid", receipt, evaluation: now, consent } };
+      });
+
+    let result = await attempt();
+    if (result.kind === "needs_approval") {
+      const r = await askOwner(result.reasons);
+      if ("status" in r) return r;
+      consent = r;
+      result = await attempt();
     }
-    const settle = decodePaymentResponseHeader(payRes.headers.get(H.paymentResponse) ?? "");
-    const receipt = (await payRes.json()) as Receipt;
-    ledger.append({ type: "payment_settled", actor: badge, orderId, data: { amount: req.amount, asset: req.asset, txHash: settle.transaction, network: settle.network, merchant: merchant.badge } });
-    // Money has moved, so this cannot undo the purchase; it records whether the receipt is usable evidence.
-    const receiptIssues: string[] = [];
-    if (!(await verifySigned(this.cfg.verifier, receipt.merchantSignature, "signet-receipt", receiptBody(receipt), [merchant.owner, merchant.agentWallet]))) receiptIssues.push("bad_merchant_signature");
-    if (receipt.orderHash !== offer.orderHash || receipt.orderId !== orderId) receiptIssues.push("order_mismatch");
-    if (receipt.paid !== req.amount || receipt.asset !== req.asset || receipt.payTo !== req.payTo) receiptIssues.push("terms_mismatch");
-    if (receipt.txHash !== settle.transaction) receiptIssues.push("tx_mismatch");
-    if (receipt.buyer !== badge || receipt.payer !== this.cfg.prover.account) receiptIssues.push("buyer_mismatch");
-    ledger.append({ type: "delivery", actor: badge, orderId, data: { receiptHash: hashOf(receipt), receiptOk: receiptIssues.length === 0, receiptIssues }, privateRecord: receipt });
-    return { status: "paid", receipt, evaluation, consent };
+    return result.kind === "done" ? result.outcome : { status: "denied", stage: "consent", reasons: ["approval_required"], evaluation };
   }
 }
+
+interface Hold {
+  id?: string;
+  keep: boolean;
+}
+
+/** Spec: no answer from the owner in 10 minutes means no. */
+export const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60_000;
 
 /** Fetches a receipt's inclusion proof from the merchant; undefined while its batch is not anchored yet. */
 export async function fetchReceiptProof(merchantUrl: string, orderId: string, f: typeof fetch = fetch): Promise<ReceiptProof | undefined> {
