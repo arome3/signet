@@ -5,7 +5,7 @@ import type { AccountProver, AccountVerifier, AgentRegistry, DomainVerifier } fr
 /**
  * Verified-merchant directory (the spec's hackathon shortcut: a static list signed by the directory
  * operator). Each listing is signed by the merchant's badge account and binds together:
- *   badge  <->  brand (one brand per business, no look-alikes)  <->  domain (DNS TXT proof)
+ *   badge  <->  brand (one per business; ASCII, one script)  <->  domain (DNS TXT proof; ASCII)
  *          <->  endpoint (the URL the buyer talks to)  <->  listed prices and categories.
  * The buyer re-checks all of it at purchase time and compares every quoted line with the listing.
  */
@@ -37,6 +37,8 @@ export interface Directory {
   v: 1;
   operator: string;
   issuedAt: string;
+  /** The operator's explicit exceptions to the ASCII / single-script rule. */
+  allowlist: ScriptAllowlist;
   listings: SignedListing[];
 }
 
@@ -49,19 +51,49 @@ export async function signListing(listing: Listing, merchant: AccountProver): Pr
   return { listing, merchantSignature: await signAs(merchant, "signet-listing", listing) };
 }
 
-/** Latin look-alikes that NFKC does not fold (Cyrillic and Greek), enough to stop "FrеshMart". */
-const CONFUSABLES: Record<string, string> = {
-  а: "a", в: "b", е: "e", ё: "e", к: "k", м: "m", н: "h", о: "o", р: "p", с: "c", т: "t", у: "y", х: "x", і: "i", ї: "i", ј: "j", ѕ: "s", ԁ: "d", ɡ: "g",
-  α: "a", β: "b", ε: "e", η: "n", ι: "i", κ: "k", μ: "u", ν: "v", ο: "o", ρ: "p", τ: "t", υ: "u", χ: "x",
-  "0": "o", "1": "l", "3": "e", "5": "s",
-};
+/**
+ * Brands and domains must be plain ASCII and use one script. Anything else (Cyrillic or Greek letters
+ * that look Latin, fullwidth letters, accents, invisible characters, punycode `xn--` domains) is refused
+ * unless the operator allowlists that exact string; the allowlist is part of the signed directory.
+ */
+export interface ScriptAllowlist {
+  brands?: string[];
+  domains?: string[];
+}
 
-/** Comparison key for brands: case, spacing, punctuation, digits-for-letters and look-alikes ignored. */
+const SCRIPTS = ["Latin", "Cyrillic", "Greek", "Armenian", "Georgian", "Hebrew", "Arabic", "Devanagari", "Thai", "Hangul", "Hiragana", "Katakana", "Han"].map(
+  (name) => [name, new RegExp(`\\p{Script=${name}}`, "u")] as const,
+);
+
+/** Scripts of the letters in `text` (digits, spaces and punctuation are script-neutral). */
+export function scriptsOf(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const ch of text) {
+    if (!/\p{L}/u.test(ch)) continue;
+    out.add(SCRIPTS.find(([, re]) => re.test(ch))?.[0] ?? "Other");
+  }
+  return out;
+}
+
+export function brandTextIssues(brand: string, allow: ScriptAllowlist = {}): string[] {
+  if ((allow.brands ?? []).some((b) => b.normalize("NFC") === brand.normalize("NFC"))) return [];
+  const issues: string[] = [];
+  if (scriptsOf(brand).size > 1) issues.push("brand_mixed_script");
+  if (/[^\x20-\x7E]/.test(brand)) issues.push("brand_non_ascii");
+  return issues;
+}
+
+export function domainTextIssues(domain: string, allow: ScriptAllowlist = {}): string[] {
+  if ((allow.domains ?? []).some((d) => d.toLowerCase() === domain.toLowerCase())) return [];
+  const issues: string[] = [];
+  if (scriptsOf(domain).size > 1) issues.push("domain_mixed_script");
+  if (/[^\x21-\x7E]/.test(domain) || /(^|\.)xn--/i.test(domain)) issues.push("domain_non_ascii");
+  return issues;
+}
+
+/** Comparison key for brands: case, spacing and punctuation ignored. */
 export function brandKey(brand: string): string {
-  return [...brand.normalize("NFKC").toLowerCase()]
-    .map((ch) => CONFUSABLES[ch] ?? ch)
-    .join("")
-    .replace(/[^a-z]/g, "");
+  return brand.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
 }
 
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
@@ -86,10 +118,12 @@ export interface ListingDeps {
   domains: DomainVerifier;
   /** Mock and local development only: accept http://127.0.0.1-style endpoints. */
   allowLoopbackEndpoints?: boolean;
+  /** Operator side: exceptions to the script rule (written into the signed directory). */
+  scriptAllowlist?: ScriptAllowlist;
 }
 
 /** Checks one listing on its own: merchant signature, verified business badge, domain and endpoint. */
-async function checkListing(sl: SignedListing, deps: ListingDeps): Promise<string[]> {
+async function checkListing(sl: SignedListing, deps: ListingDeps, allow: ScriptAllowlist): Promise<string[]> {
   const l = sl?.listing;
   if (!l || l.v !== 1 || !l.badge || !l.brand || !l.domain || !l.endpoint || !Array.isArray(l.items)) return ["listing_malformed"];
   const issues: string[] = [];
@@ -100,13 +134,15 @@ async function checkListing(sl: SignedListing, deps: ListingDeps): Promise<strin
   if (!v.owner || !(await deps.domains.verify(l.domain, v.owner).catch(() => false))) issues.push("domain_not_proven");
   if (!endpointOnDomain(l.endpoint, l.domain, deps.allowLoopbackEndpoints)) issues.push("endpoint_not_on_domain");
   if (!brandKey(l.brand)) issues.push("brand_empty");
+  issues.push(...brandTextIssues(l.brand, allow), ...domainTextIssues(l.domain, allow));
   return issues;
 }
 
 /**
  * Operator side: vets listings and signs the ones that pass. A brand belongs to the first business
- * owner that lists it; a later listing with the same or a look-alike brand from another owner is
- * refused, and each business owner gets one brand.
+ * owner that lists it; a later listing with the same brand (ignoring case, spacing and punctuation)
+ * from another owner is refused, each business owner gets one brand, and brands and domains must pass
+ * the ASCII / single-script rule unless allowlisted.
  */
 export async function buildDirectory(
   listings: SignedListing[],
@@ -118,7 +154,7 @@ export async function buildDirectory(
   const brandOwner = new Map<string, string>();
   const ownerBrand = new Map<string, string>();
   for (const sl of listings) {
-    const reasons = await checkListing(sl, deps);
+    const reasons = await checkListing(sl, deps, deps.scriptAllowlist ?? {});
     const owner = (await deps.registry.check(sl.listing.badge)).owner ?? "";
     const key = brandKey(sl.listing.brand);
     if (brandOwner.has(key) && brandOwner.get(key) !== owner) reasons.push("brand_taken");
@@ -132,7 +168,8 @@ export async function buildDirectory(
     ownerBrand.set(owner, key);
     accepted.push(sl);
   }
-  const directory: Directory = { v: 1, operator: operator.account, issuedAt: new Date().toISOString(), listings: accepted };
+  const allowlist: ScriptAllowlist = { brands: deps.scriptAllowlist?.brands ?? [], domains: deps.scriptAllowlist?.domains ?? [] };
+  const directory: Directory = { v: 1, operator: operator.account, issuedAt: new Date().toISOString(), allowlist, listings: accepted };
   return { directory: { directory, operatorSignature: await signAs(operator, "signet-directory", directory) }, refused };
 }
 
@@ -153,10 +190,10 @@ export async function checkMerchantListing(
   if (mine.length !== 1) return { issues: [mine.length ? "merchant_listed_twice" : "merchant_not_listed"] };
   const sl = mine[0];
   const l = sl.listing;
-  const issues = await checkListing(sl, deps);
+  const issues = await checkListing(sl, deps, dir.directory.allowlist ?? {});
   const key = brandKey(l.brand);
   if (dir.directory.listings.some((x) => x !== sl && brandKey(x.listing.brand) === key)) issues.push("brand_conflict");
-  if (brandKey(answered.name) !== key) issues.push("brand_mismatch");
+  if (answered.name !== l.brand) issues.push("brand_mismatch");
   if (answered.domain?.toLowerCase() !== l.domain.toLowerCase()) issues.push("domain_mismatch");
   let contactedOrigin = "";
   try {

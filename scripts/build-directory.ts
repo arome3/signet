@@ -20,6 +20,7 @@ import { CATALOG } from "../demo/scenario.js";
 if (existsSync(".env")) process.loadEnvFile(".env");
 const need = (n: string): string => process.env[n] || (console.error(`missing env ${n} (see .env.example)`), process.exit(1));
 
+const list = (v?: string) => (v ? v.split(",").map((x) => x.trim()).filter(Boolean) : []);
 const cfg = loadConfig();
 const grpc = grpcClient(cfg);
 const merchant = loadWalletExport(need("MERCHANT_WALLET_FILE"));
@@ -33,6 +34,8 @@ const { directory, refused } = await buildDirectory([await signListing(listing, 
   verifier: new ConcordiumAccountVerifier(grpc),
   domains: new DnsDomainVerifier(),
   allowLoopbackEndpoints: process.env.SIGNET_ALLOW_LOOPBACK_ENDPOINTS === "1",
+  // Exact brands/domains exempt from the ASCII, single-script rule (comma-separated); signed into the directory.
+  scriptAllowlist: { brands: list(process.env.DIRECTORY_ALLOW_BRANDS), domains: list(process.env.DIRECTORY_ALLOW_DOMAINS) },
 });
 for (const r of refused) console.error(`REFUSED ${r.brand} (${r.badge}): ${r.reasons.join(", ")}`);
 const out = process.env.DIRECTORY_FILE ?? "out/directory.json";
