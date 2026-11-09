@@ -4,7 +4,7 @@ import type { LiveConfig } from "./config.js";
 
 /**
  * Reads finalized transactions over gRPC for receipt verification: RegisterData payloads (Signet
- * anchors) and PLT TokenTransfer events (x402 payments). Anything not finalized, not of the expected
+ * anchors), and x402 payments as PLT TokenTransfer events or native CCD transfers (asset "CCD"). Anything not finalized, not of the expected
  * kind, or not understood by this SDK version reads as "not found", so receipt checks fail closed.
  *
  * Status: written against @concordium/web-sdk 12 types; not yet run against testnet.
@@ -33,6 +33,11 @@ export class ConcordiumChainReader implements ChainReader {
 
   async transfers(txHash: string) {
     const s = await this.finalizedSummary(txHash);
+    // Native CCD (x402 asset "CCD"): a simple transfer, amount in microCCD.
+    if ((s?.transactionType === TransactionKindString.Transfer || s?.transactionType === TransactionKindString.TransferWithMemo) && s.sender && s.transfer?.to) {
+      if (s.transfer.tag !== TransactionEventTag.Transferred) return undefined;
+      return [{ from: AccountAddress.toBase58(s.sender), to: AccountAddress.toBase58(s.transfer.to), asset: "CCD", amount: String(s.transfer.amount?.microCcdAmount ?? s.transfer.amount?.value ?? s.transfer.amount) }];
+    }
     if (s?.transactionType !== TransactionKindString.TokenUpdate || !Array.isArray(s.events)) return undefined;
     const out: { from: string; to: string; asset: string; amount: string }[] = [];
     for (const ev of s.events) {

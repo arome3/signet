@@ -56,8 +56,7 @@ export class ConcordiumRegistry implements AgentRegistry {
     }
     if (tokenId !== undefined) {
       const meta = await this.tool("get_metadata", { token_id: String(tokenId), key: "signet.mandate", network: this.cfg.network });
-      const val = (meta.data as any)?.value ?? (meta.data as any)?.value_hex;
-      if (!meta.error && typeof val === "string") v.mandateHash = decodeMaybeHex(val);
+      if (!meta.error) v.mandateHash = mandateFromMetadata(meta.data);
     }
     if (v.owner) {
       const ip = await this.identityProviderOf(v.owner);
@@ -95,36 +94,56 @@ export class ConcordiumRegistry implements AgentRegistry {
     return this.idpKinds.get(ip) ?? "human";
   }
 
-  private async tool(name: string, args: Record<string, unknown>): Promise<{ data?: unknown; error?: string }> {
-    try {
-      const res = await fetch(this.cfg.registryMcpUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: ++this.rpcId, method: "tools/call", params: { name, arguments: args } }),
-        signal: AbortSignal.timeout(15_000),
-      });
-      let body = await res.text();
-      if (body.startsWith("event:") || body.startsWith("data:")) body = body.split("\n").find((l) => l.startsWith("data:"))?.slice(5).trim() ?? body;
-      const msg = JSON.parse(body);
-      if (msg.error) return { error: msg.error.message ?? JSON.stringify(msg.error) };
-      const text = msg.result?.content?.[0]?.text ?? "";
-      if (msg.result?.isError) return { error: text };
-      if (msg.result?.structuredContent) return { data: msg.result.structuredContent };
-      try {
-        return { data: JSON.parse(text) };
-      } catch {
-        return { data: text };
-      }
-    } catch (e) {
-      return { error: (e as Error).message };
-    }
+  private tool(name: string, args: Record<string, unknown>) {
+    return registryTool(this.cfg.registryMcpUrl, name, args, ++this.rpcId);
   }
 }
 
-function decodeMaybeHex(v: string): string {
-  if (/^[0-9a-f]+$/i.test(v) && v.length !== 64 && v.length % 2 === 0) {
-    const s = Buffer.from(v, "hex").toString("utf8");
-    if (/^[0-9a-f]{64}$/.test(s)) return s;
+/** Calls one tool on the hosted Agent Registry MCP server (stateless JSON-RPC over Streamable HTTP). */
+export async function registryTool(url: string, name: string, args: Record<string, unknown>, id = 1): Promise<{ data?: unknown; error?: string }> {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    let body = await res.text();
+    if (body.startsWith("event:") || body.startsWith("data:")) body = body.split("\n").find((l) => l.startsWith("data:"))?.slice(5).trim() ?? body;
+    const msg = JSON.parse(body);
+    if (msg.error) return { error: msg.error.message ?? JSON.stringify(msg.error) };
+    const text = msg.result?.content?.[0]?.text ?? "";
+    if (msg.result?.isError) return { error: text };
+    if (msg.result?.structuredContent) return { data: msg.result.structuredContent };
+    try {
+      return { data: JSON.parse(text) };
+    } catch {
+      return { data: text };
+    }
+  } catch (e) {
+    return { error: (e as Error).message };
   }
-  return v;
+}
+
+/**
+ * Extracts the mandate hash from a get_metadata result. Signet writes the 64-character hex hash as
+ * UTF-8 text; the server returns it as hex and (when valid UTF-8) as text, under field names this
+ * accepts in several forms. Anything that is not a 64-hex hash reads as "not published".
+ */
+export function mandateFromMetadata(data: unknown): string | undefined {
+  const isHash = (x: unknown): x is string => typeof x === "string" && /^[0-9a-f]{64}$/i.test(x);
+  const d = data as Record<string, unknown> | string | null | undefined;
+  if (!d) return undefined;
+  const candidates: unknown[] = typeof d === "string" ? [d] : [d.text, d.value_text, d.value_utf8, d.utf8, d.value, d.value_hex, d.hex];
+  for (const c of candidates) {
+    if (isHash(c) && c.length === 64) {
+      // 64 hex chars is either the hash as text, or 32 raw bytes as hex; both are the hash.
+      return c.toLowerCase();
+    }
+    if (typeof c === "string" && /^[0-9a-f]{128}$/i.test(c)) {
+      const text = Buffer.from(c, "hex").toString("utf8");
+      if (isHash(text)) return text.toLowerCase();
+    }
+  }
+  return undefined;
 }
