@@ -2,6 +2,7 @@ import express, { type Request, type Response } from "express";
 import { decodePaymentSignatureHeader, encodePaymentRequiredHeader, encodePaymentResponseHeader } from "@x402/core/http";
 import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402/core/types";
 import { hashOf, randomHex } from "../core/canonical.js";
+import { orderMemo } from "../core/memo.js";
 import { type BadgeProof, type Challenge, checkBadgeProof, decodeHeader, newChallenge, proveBadge } from "../core/challenge.js";
 import { checkApproval } from "../core/consent.js";
 import type { Listing } from "../core/directory.js";
@@ -143,7 +144,7 @@ export function createMerchantApp(cfg: SellerConfig) {
     const session = "ses_" + randomHex(16);
     const challenge = newChallenge(cfg.badge, orderHash, { session });
     const merchantProof: BadgeProof = await proveBadge(cfg.badge, cfg.prover, newChallenge(buyerBadge, orderHash, { session, nonce: buyerNonce, ttlSeconds: 300 }));
-    const requirements = await cfg.rail.requirements({ payTo: cfg.payTo, asset: cfg.asset, amount: total });
+    const requirements = await cfg.rail.requirements({ payTo: cfg.payTo, asset: cfg.asset, amount: total, memo: orderMemo(orderHash) });
     const ageRequest = ageOver && cfg.makeAgeRequest ? await cfg.makeAgeRequest(ageOver, orderHash) : undefined;
     pending.set(order.id, { state: "quoted", order, orderHash, session, challenge, requirements, buyerBadge, ageOver, ageRequest });
     store.save();

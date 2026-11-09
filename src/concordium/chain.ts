@@ -1,4 +1,5 @@
 import { AccountAddress, TransactionEventTag, TransactionHash, TransactionKindString, TransactionStatusEnum, type ConcordiumGRPCClient } from "@concordium/web-sdk";
+import { decodeMemo, decodeMemoBlob } from "../core/memo.js";
 import type { ChainReader } from "../core/types.js";
 import type { LiveConfig } from "./config.js";
 
@@ -36,13 +37,15 @@ export class ConcordiumChainReader implements ChainReader {
     // Native CCD (x402 asset "CCD"): a simple transfer, amount in microCCD.
     if ((s?.transactionType === TransactionKindString.Transfer || s?.transactionType === TransactionKindString.TransferWithMemo) && s.sender && s.transfer?.to) {
       if (s.transfer.tag !== TransactionEventTag.Transferred) return undefined;
-      return [{ from: AccountAddress.toBase58(s.sender), to: AccountAddress.toBase58(s.transfer.to), asset: "CCD", amount: String(s.transfer.amount?.microCcdAmount ?? s.transfer.amount?.value ?? s.transfer.amount) }];
+      const memo = typeof s.memo?.memo === "string" ? decodeMemoBlob(Buffer.from(s.memo.memo, "hex")) : undefined;
+      return [{ from: AccountAddress.toBase58(s.sender), to: AccountAddress.toBase58(s.transfer.to), asset: "CCD", amount: String(s.transfer.amount?.microCcdAmount ?? s.transfer.amount?.value ?? s.transfer.amount), memo }];
     }
     if (s?.transactionType !== TransactionKindString.TokenUpdate || !Array.isArray(s.events)) return undefined;
-    const out: { from: string; to: string; asset: string; amount: string }[] = [];
+    const out: { from: string; to: string; asset: string; amount: string; memo?: string }[] = [];
     for (const ev of s.events) {
       if (!ev || ev.tag !== TransactionEventTag.TokenTransfer || !ev.from?.address || !ev.to?.address) continue;
-      out.push({ from: AccountAddress.toBase58(ev.from.address), to: AccountAddress.toBase58(ev.to.address), asset: String(ev.tokenId?.value ?? ev.tokenId), amount: String(ev.amount?.value) });
+      const memo = ev.memo?.content instanceof Uint8Array ? decodeMemo(ev.memo.content) : undefined;
+      out.push({ from: AccountAddress.toBase58(ev.from.address), to: AccountAddress.toBase58(ev.to.address), asset: String(ev.tokenId?.value ?? ev.tokenId), amount: String(ev.amount?.value), memo });
     }
     return out;
   }
